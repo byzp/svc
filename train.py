@@ -2,16 +2,37 @@ import logging
 import multiprocessing
 import os
 import time
+import signal
+import sys
+import os
+import threading
 
 import torch
+
+# 启用 SDPA 优化，使用 Flash kernel
+if hasattr(torch.backends.cuda, 'sdp_kernel'):
+    torch.backends.cuda.sdp_enabled = True
+    torch.backends.cuda.sdp_kernel = "flash"
+
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+"""
+# === xFormers patch start ===
+import xformers.ops as xops
+from torch.nn import MultiheadAttention
 
+def _patched_mha_forward(self, query, key, value, **kwargs):
+    # memory_efficient_attention 返回 (attn_output, None)
+    return xops.memory_efficient_attention(query, key, value), None
+
+MultiheadAttention.forward = _patched_mha_forward
+# === xFormers patch end ===
+"""
 import modules.commons as commons
 import utils
 from data_utils import TextAudioCollate, TextAudioSpeakerLoader
@@ -25,12 +46,18 @@ from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('numba').setLevel(logging.WARNING)
 
+terminate_flag = threading.Event()
+
 torch.backends.cudnn.benchmark = True
 global_step = 0
 start_time = time.time()
 
 # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'INFO'
 
+torch.set_float32_matmul_precision('high')  # 加速矩阵乘法
+torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32矩阵乘法
+torch.backends.cudnn.allow_tf32 = True  # 允许TF32卷积
+torch.backends.cudnn.benchmark = True  # 加速卷积运算
 
 def main():
     """Assume Single Node Multi GPUs Training Only"""
@@ -163,7 +190,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             hps.data.mel_fmin,
             hps.data.mel_fmax)
         
-        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             y_hat, ids_slice, z_mask, \
             (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=g, c_lengths=lengths,
                                                                                 spec_lengths=lengths,vol = volume)
@@ -184,7 +211,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             # Discriminator
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-            with autocast(enabled=False, dtype=half_type):
+            with autocast(enabled=False, dtype=half_type,device_type='cuda'):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
         
@@ -195,10 +222,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         scaler.step(optim_d)
         
 
-        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            with autocast(enabled=False, dtype=half_type):
+            with autocast(enabled=False, dtype=half_type,device_type='cuda'):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
@@ -264,6 +291,11 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
 
         global_step += 1
+        
+        if terminate_flag.is_set():
+            save_model_on_exit(rank, hps, net_g, net_d, optim_g, optim_d, epoch)
+            sys.exit(0)
+
 
     if rank == 0:
         global start_time
@@ -324,6 +356,24 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     )
     generator.train()
 
+def save_model_on_exit(rank, hps, net_g, net_d, optim_g, optim_d, epoch):
+    if rank == 0:
+        print("\n[INFO] Saving model before exiting...")
+        from utils import save_checkpoint  # 延迟导入防止循环
+        save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
+                        os.path.join(hps.model_dir, f"G_{global_step}.pth"))
+        save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
+                        os.path.join(hps.model_dir, f"D_{global_step}.pth"))
+
+def handle_sigint(signum, frame):
+    if not terminate_flag.is_set():
+        print("\n[INFO] Received Ctrl+C, will save and exit after current iteration. Press again to force exit.")
+        terminate_flag.set()
+    else:
+        print("\n[INFO] Forced termination.")
+        sys.exit(1)
+
+signal.signal(signal.SIGINT, handle_sigint)
 
 if __name__ == "__main__":
     main()
