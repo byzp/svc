@@ -84,7 +84,7 @@ def mel_filters(device, n_mels: int = N_MELS) -> torch.Tensor:
             mel_80=librosa.filters.mel(sr=16000, n_fft=400, n_mels=80),
         )
     """
-    assert n_mels == 80, f"Unsupported n_mels: {n_mels}"
+    #assert n_mels == 80, f"Unsupported n_mels: {n_mels}"
     return torch.from_numpy(librosa_mel_fn(sr=SAMPLE_RATE,n_fft=N_FFT,n_mels=n_mels)).to(device)
 
 

@@ -515,14 +515,21 @@ class SynthesizerTrn(nn.Module):
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
         # vol proj
         
-        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
+        vol = self.emb_vol(vol[:,:,None].to(dtype=self.emb_vol.weight.dtype)).transpose(1,2) if vol is not None and self.vol_embedding else 0
+        
+        # Get model dtype (usually float16 if model.half() was used)
+        model_dtype = self.pre.weight.dtype
+        # Cast inputs
+        c = c.to(dtype=model_dtype)
+        uv = uv.to(dtype=model_dtype)
+        vol = vol.to(dtype=model_dtype)
 
         x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol
 
         
         if self.use_automatic_f0_prediction and predict_f0:
             lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
-            norm_lf0 = utils.normalize_f0(lf0, x_mask, uv, random_scale=False)
+            norm_lf0 = utils.normalize_f0(lf0, x_mask, uv, random_scale=False).to(f0)
             pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
             f0 = (700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)).squeeze(1)
         

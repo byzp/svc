@@ -1,15 +1,21 @@
 import logging
-
+import os
 import soundfile
 
 from inference import infer_tool
 from inference.infer_tool import Svc
 from spkmix import spk_mix_map
 
+os.environ["OMP_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))
+os.environ["MKL_NUM_THREADS"] = str(len(os.sched_getaffinity(0)))
+
+import torch
+
 logging.getLogger('numba').setLevel(logging.WARNING)
 chunks_dict = infer_tool.read_temp("inference/chunks_temp.json")
 
-
+#torch.set_num_threads(len(os.sched_getaffinity(0)))
+#torch.set_num_interop_threads(1)
 
 def main():
     import argparse

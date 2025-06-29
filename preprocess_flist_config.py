@@ -30,9 +30,10 @@ if __name__ == "__main__":
     parser.add_argument("--train_list", type=str, default="./filelists/train.txt", help="path to train list")
     parser.add_argument("--val_list", type=str, default="./filelists/val.txt", help="path to val list")
     parser.add_argument("--source_dir", type=str, default="./dataset/44k", help="path to source dir")
-    parser.add_argument("--speech_encoder", type=str, default="vec768l12", help="choice a speech encoder|'vec768l12','vec256l9','hubertsoft','whisper-ppg','cnhubertlarge','dphubert','whisper-ppg-large','wavlmbase+'")
+    parser.add_argument("--speech_encoder", type=str, default="vec768l12", help="choice a speech encoder|'vec768l12','vec256l9','hubertsoft','whisper-ppg','whisper-ppg-large','cnhubertlarge','dphubert','whisper-ppg-large-v3','wavlmbase+'")
     parser.add_argument("--vol_aug", action="store_true", help="Whether to use volume embedding and volume augmentation")
     parser.add_argument("--tiny", action="store_true", help="Whether to train sovits tiny")
+    parser.add_argument("--tf_flow", action="store_true", help="Whether to Use transformer_flow")
     args = parser.parse_args()
     
     config_template =  json.load(open("configs_template/config_tiny_template.json")) if args.tiny else json.load(open("configs_template/config_template.json"))
@@ -102,7 +103,7 @@ if __name__ == "__main__":
     elif args.speech_encoder == "whisper-ppg" or args.speech_encoder == 'cnhubertlarge':
         config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1024
         d_config_template["data"]["encoder_out_channels"] = 1024
-    elif args.speech_encoder == "whisper-ppg-large":
+    elif args.speech_encoder == "whisper-ppg-large" or args.speech_encoder == "whisper-ppg-large-v3":
         config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1280
         d_config_template["data"]["encoder_out_channels"] = 1280
         
@@ -111,7 +112,10 @@ if __name__ == "__main__":
 
     if args.tiny:
         config_template["model"]["filter_channels"] = 512
-
+    
+    if args.tf_flow:
+        config_template["model"]["flow_share_parameter"] = config_template["model"]["use_transformer_flow"] = True
+    
     logger.info("Writing to configs/config.json")
     with open("configs/config.json", "w") as f:
         json.dump(config_template, f, indent=2)

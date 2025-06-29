@@ -26,7 +26,8 @@ class ModelDimensions:
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
+        #return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.float()).type(torch.float32)
 
 
 class Linear(nn.Linear):

@@ -60,8 +60,10 @@ def plot_data_to_numpy(x, y):
     plt.tight_layout()
 
     fig.canvas.draw()
-    data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    w, h = fig.canvas.get_width_height()
+    data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    data = data[:, :, :3]
+
     plt.close()
     return data
 
@@ -100,7 +102,7 @@ def get_f0_predictor(f0_predictor,hop_length,sampling_rate,**kargs):
         f0_predictor_object = DioF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate) 
     elif f0_predictor == "rmvpe":
         from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor
-        f0_predictor_object = RMVPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
+        f0_predictor_object = RMVPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float16 ,device=kargs["device"],threshold=kargs["threshold"])
     elif f0_predictor == "fcpe":
         from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor
         f0_predictor_object = FCPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
@@ -145,6 +147,9 @@ def get_speech_encoder(speech_encoder,device=None,**kargs):
     elif speech_encoder == "whisper-ppg-large":
         from vencoder.WhisperPPGLarge import WhisperPPGLarge
         speech_encoder_object = WhisperPPGLarge(device = device)
+    elif speech_encoder == "whisper-ppg-large-v3":
+        from vencoder.WhisperPPGLargeV3 import WhisperPPGLargeV3
+        speech_encoder_object = WhisperPPGLargeV3(device = device)
     elif speech_encoder == "wavlmbase+":
         from vencoder.WavLMBasePlus import WavLMBasePlus
         speech_encoder_object = WavLMBasePlus(device = device)
@@ -263,8 +268,10 @@ def plot_spectrogram_to_numpy(spectrogram):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  w, h = fig.canvas.get_width_height()
+  data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+  data = data[:, :, :3]
+
   plt.close()
   return data
 
@@ -292,8 +299,10 @@ def plot_alignment_to_numpy(alignment, info=None):
   plt.tight_layout()
 
   fig.canvas.draw()
-  data = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
-  data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+  w, h = fig.canvas.get_width_height()
+  data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+  data = data[:, :, :3]
+
   plt.close()
   return data
 
@@ -566,7 +575,6 @@ class Volume_Extractor:
            audio = torch.Tensor(audio)
         n_frames = int(audio.size(-1) // self.hop_size)
         audio2 = audio ** 2
-        audio2 = torch.nn.functional.pad(audio2, (int(self.hop_size // 2), int((self.hop_size + 1) // 2)), mode = 'reflect')
         volume = torch.nn.functional.unfold(audio2[:,None,None,:],(1,self.hop_size),stride=self.hop_size)[:,:,:n_frames].mean(dim=1)[0]
         volume = torch.sqrt(volume)
         return volume
