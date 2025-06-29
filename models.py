@@ -516,14 +516,14 @@ class SynthesizerTrn(nn.Module):
         # vol proj
         
         vol = self.emb_vol(vol[:,:,None].to(dtype=self.emb_vol.weight.dtype)).transpose(1,2) if vol is not None and self.vol_embedding else 0
-        
+        """
         # Get model dtype (usually float16 if model.half() was used)
         model_dtype = self.pre.weight.dtype
         # Cast inputs
         c = c.to(dtype=model_dtype)
         uv = uv.to(dtype=model_dtype)
         vol = vol.to(dtype=model_dtype)
-
+        """
         x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol
 
         
