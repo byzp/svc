@@ -198,7 +198,7 @@ class Svc(object):
             **self.hps_ms.model)
         _ = utils.load_checkpoint(self.net_g_path, self.net_g_ms, None)
         self.dtype = list(self.net_g_ms.parameters())[0].dtype
-        if self.dev.type == "cuda":
+        if self.dev.type == "cuda" and False: #TODO
             print("infer_tool.load_model half()")
             _ = self.net_g_ms.half().eval().to(self.dev)
         else:
