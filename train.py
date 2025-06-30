@@ -48,7 +48,6 @@ logging.getLogger('numba').setLevel(logging.WARNING)
 
 terminate_flag = threading.Event()
 
-torch.backends.cudnn.benchmark = True
 global_step = 0
 start_time = time.time()
 
@@ -90,7 +89,7 @@ def run(rank, n_gpus, hps):
     num_workers = 5 if multiprocessing.cpu_count() > 4 else multiprocessing.cpu_count()
     if all_in_mem:
         num_workers = 0
-    train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True,
+    train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True, persistent_workers=True, prefetch_factor=hps.train.batch_size*4,
                               batch_size=hps.train.batch_size, collate_fn=collate_fn)
     if rank == 0:
         eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps, all_in_mem=all_in_mem,vol_aug = False)
@@ -115,6 +114,7 @@ def run(rank, n_gpus, hps):
         eps=hps.train.eps)
     net_g = DDP(net_g, device_ids=[rank])  # , find_unused_parameters=True)
     net_d = DDP(net_d, device_ids=[rank])
+
 
     skip_optimizer = False
     try:
@@ -167,6 +167,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     if writers is not None:
         writer, writer_eval = writers
     
+    accum_steps = getattr(hps.train, "grad_accumulate", 1)
+    
     half_type = torch.bfloat16 if hps.train.half_type=="bf16" else torch.float16
 
     # train_loader.batch_sampler.set_epoch(epoch)
@@ -209,17 +211,23 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)  # slice
 
             # Discriminator
+            # —— 1）Disc forward / backward —— 
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
             with autocast(enabled=False, dtype=half_type,device_type='cuda'):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
         
-        optim_d.zero_grad()
+        loss_disc_all = loss_disc_all / accum_steps
         scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
+
+        # 只有当累积步数到达时，才实际更新 D
+        if (batch_idx + 1) % accum_steps == 0:
+            scaler.unscale_(optim_d)
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            scaler.step(optim_d)
+            optim_d.zero_grad()
+            # scaler.update() 不在 discriminator 更新里调用，交给 generator 完成
         
 
         with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
@@ -232,17 +240,28 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
-        optim_g.zero_grad()
+        # —— 2）Gen forward / backward —— 
+        loss_gen_all = loss_gen_all / accum_steps
         scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+
+        if (batch_idx + 1) % accum_steps == 0:
+            scaler.unscale_(optim_g)
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
+            scaler.update()
+            optim_g.zero_grad()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]['lr']
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
+                """
+                losses = [loss_disc * accum_steps,
+                    loss_gen  * accum_steps,
+                    loss_fm   * accum_steps,
+                    loss_mel  * accum_steps,
+                    loss_kl   * accum_steps]
+                """
                 reference_loss=0
                 for i in losses:
                     reference_loss += i
@@ -250,11 +269,21 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     epoch,
                     100. * batch_idx / len(train_loader)))
                 logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr}, reference_loss: {reference_loss}")
+            if (batch_idx + 1) % accum_steps == 0:
 
-                scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr,
-                               "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
-                scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/kl": loss_kl,
-                                    "loss/g/lf0": loss_lf0})
+                scalar_dict = {
+                    "loss/g/total": loss_gen_all, #* accum_steps,
+                    "loss/d/total": loss_disc_all, #* accum_steps,
+                    "learning_rate": lr,
+                    "grad_norm_d": grad_norm_d,
+                    "grad_norm_g": grad_norm_g,
+                }
+                scalar_dict.update({
+                    "loss/g/fm": loss_fm, #* accum_steps,
+                    "loss/g/mel": loss_mel, #* accum_steps,
+                    "loss/g/kl": loss_kl, #* accum_steps,
+                    "loss/g/lf0": loss_lf0, #* accum_steps
+                })
 
                 # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
                 # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
@@ -279,6 +308,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     images=image_dict,
                     scalars=scalar_dict
                 )
+                
 
             if global_step % hps.train.eval_interval == 0:
                 evaluate(hps, net_g, eval_loader, writer_eval)
@@ -309,7 +339,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
     image_dict = {}
     audio_dict = {}
-    with torch.no_grad():
+    with torch.inference_mode(): # 比torch.no_grad()快一点
         for batch_idx, items in enumerate(eval_loader):
             c, f0, spec, y, spk, _, uv,volume = items
             g = spk[:1].cuda(0)
