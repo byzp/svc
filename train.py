@@ -222,7 +222,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         scaler.scale(loss_disc_all).backward()
 
         # 只有当累积步数到达时，才实际更新 D
-        if (batch_idx + 1) % accum_steps == 0:
+        up_optim=(batch_idx + 1) % accum_steps == 0
+        if up_optim:
             scaler.unscale_(optim_d)
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
             scaler.step(optim_d)
@@ -244,7 +245,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         loss_gen_all = loss_gen_all / accum_steps
         scaler.scale(loss_gen_all).backward()
 
-        if (batch_idx + 1) % accum_steps == 0:
+        if up_optim:
             scaler.unscale_(optim_g)
             grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
             scaler.step(optim_g)
@@ -269,48 +270,46 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     epoch,
                     100. * batch_idx / len(train_loader)))
                 logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr}, reference_loss: {reference_loss}")
-            if (batch_idx + 1) % accum_steps == 0:
-
-                scalar_dict = {
-                    "loss/g/total": loss_gen_all, #* accum_steps,
-                    "loss/d/total": loss_disc_all, #* accum_steps,
-                    "learning_rate": lr,
-                    "grad_norm_d": grad_norm_d,
-                    "grad_norm_g": grad_norm_g,
-                }
-                scalar_dict.update({
-                    "loss/g/fm": loss_fm, #* accum_steps,
-                    "loss/g/mel": loss_mel, #* accum_steps,
-                    "loss/g/kl": loss_kl, #* accum_steps,
-                    "loss/g/lf0": loss_lf0, #* accum_steps
-                })
-
-                # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
-                # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
-                # scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
-                image_dict = {
-                    "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
-                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
-                    "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
-                }
-
-                if net_g.module.use_automatic_f0_prediction:
-                    image_dict.update({
-                        "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                              pred_lf0[0, 0, :].detach().cpu().numpy()),
-                        "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                                   norm_lf0[0, 0, :].detach().cpu().numpy())
+                if "grad_norm_d" in locals():
+                    scalar_dict = {
+                        "loss/g/total": loss_gen_all, #* accum_steps,
+                        "loss/d/total": loss_disc_all, #* accum_steps,
+                        "learning_rate": lr,
+                        "grad_norm_d": grad_norm_d,
+                        "grad_norm_g": grad_norm_g,
+                    }
+                    scalar_dict.update({
+                        "loss/g/fm": loss_fm, #* accum_steps,
+                        "loss/g/mel": loss_mel, #* accum_steps,
+                        "loss/g/kl": loss_kl, #* accum_steps,
+                        "loss/g/lf0": loss_lf0, #* accum_steps
                     })
 
-                utils.summarize(
-                    writer=writer,
-                    global_step=global_step,
-                    images=image_dict,
-                    scalars=scalar_dict
-                )
-                
+                    # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
+                    # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
+                    # scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
+                    image_dict = {
+                        "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
+                        "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
+                        "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
+                    }
 
-            if global_step % hps.train.eval_interval == 0:
+                    if net_g.module.use_automatic_f0_prediction:
+                        image_dict.update({
+                            "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                                  pred_lf0[0, 0, :].detach().cpu().numpy()),
+                            "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                                       norm_lf0[0, 0, :].detach().cpu().numpy())
+                        })
+
+                    utils.summarize(
+                        writer=writer,
+                        global_step=global_step,
+                        images=image_dict,
+                        scalars=scalar_dict
+                    )
+            
+            if global_step % hps.train.eval_interval == 0 and global_step != 0: # 不保存G_0.pth和D_0.pth
                 evaluate(hps, net_g, eval_loader, writer_eval)
                 utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
                                       os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
