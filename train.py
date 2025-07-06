@@ -176,6 +176,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     net_g.train()
     net_d.train()
+    optim_d.zero_grad()
+    optim_g.zero_grad()
+    
     for batch_idx, items in enumerate(train_loader):
         c, f0, spec, y, spk, lengths, uv,volume = items
         g = spk.cuda(rank, non_blocking=True)
@@ -192,6 +195,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             hps.data.mel_fmin,
             hps.data.mel_fmax)
         
+        up_optim=(batch_idx + 1) % accum_steps == 0
         with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             y_hat, ids_slice, z_mask, \
             (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=g, c_lengths=lengths,
@@ -218,19 +222,24 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
         
-        loss_disc_all = loss_disc_all / accum_steps
-        scaler.scale(loss_disc_all).backward()
+        loss_disc_all = loss_disc_all accum_steps
+        if up_optim:
+            scaler.scale(loss_disc_all).backward()
+        else:
+            with net_d.no_sync():
+                scaler.scale(loss_disc_all).backward()
 
         # 只有当累积步数到达时，才实际更新 D
-        up_optim=(batch_idx + 1) % accum_steps == 0
         if up_optim:
             scaler.unscale_(optim_d)
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
             scaler.step(optim_d)
+            scaler.update() # 不在 discriminator 更新里调用，交给 generator 完成
             optim_d.zero_grad()
-            # scaler.update() 不在 discriminator 更新里调用，交给 generator 完成
-        
 
+        # 冻结d
+        for p in net_d.parameters():
+            p.requires_grad = False
         with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
@@ -242,8 +251,15 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
         # —— 2）Gen forward / backward —— 
-        loss_gen_all = loss_gen_all / accum_steps
-        scaler.scale(loss_gen_all).backward()
+        loss_gen_all = loss_gen_all accum_steps
+        if up_optim:
+            scaler.scale(loss_gen_all).backward()
+        else:
+            with net_g.no_sync():
+                scaler.scale(loss_gen_all).backward()
+        # 解冻d
+        for p in net_d.parameters():
+            p.requires_grad = True
 
         if up_optim:
             scaler.unscale_(optim_g)
@@ -312,16 +328,18 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             if global_step % hps.train.eval_interval == 0 and global_step != 0: # 不保存G_0.pth和D_0.pth
                 evaluate(hps, net_g, eval_loader, writer_eval)
                 utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
+                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
+                                      Async=True)
                 utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
+                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
+                                      Async=True)
                 keep_ckpts = getattr(hps.train, 'keep_ckpts', 0)
                 if keep_ckpts > 0:
                     utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
 
         global_step += 1
         
-        if terminate_flag.is_set():
+        if terminate_flag.is_set() and up_optim:
             save_model_on_exit(rank, hps, net_g, net_d, optim_g, optim_d, epoch)
             sys.exit(0)
 

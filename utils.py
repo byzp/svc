@@ -8,6 +8,7 @@ import subprocess
 import sys
 import traceback
 from multiprocessing import cpu_count
+import threading
 
 import faiss
 import librosa
@@ -191,19 +192,40 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False
         checkpoint_path, iteration))
     return model, optimizer, learning_rate, iteration
 
+def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path, Async=False):
+    """
+    参数:
+        model             -- 要保存的模型 (可以是单卡或 DataParallel/DistributedDataParallel)
+        optimizer         -- 优化器实例
+        learning_rate     -- 当前学习率 (数值)
+        iteration         -- 当前迭代次数 (整数)
+        checkpoint_path   -- 保存文件路径
+        Async             -- 是否异步保存 (布尔)，True 则开线程后台保存，False 则阻塞直至保存完成
+    """
+    logger.info(
+        f"Saving model and optimizer state at iteration {iteration} to {checkpoint_path}"
+    )
+    if hasattr(model, 'module'):
+        state_dict = model.module.state_dict()
+    else:
+        state_dict = model.state_dict()
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
-  logger.info("Saving model and optimizer state at iteration {} to {}".format(
-    iteration, checkpoint_path))
-  if hasattr(model, 'module'):
-    state_dict = model.module.state_dict()
-  else:
-    state_dict = model.state_dict()
-  torch.save({'model': state_dict,
-              'iteration': iteration,
-              'optimizer': optimizer.state_dict(),
-              'learning_rate': learning_rate}, checkpoint_path)
+    def _do_save():
+        torch.save({
+            'model': state_dict,
+            'iteration': iteration,
+            'optimizer': optimizer.state_dict(),
+            'learning_rate': learning_rate
+        }, checkpoint_path)
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
 
+    if Async:
+        thread = threading.Thread(target=_do_save, daemon=True)
+        thread.start()
+        logger.info(f"Async save started for {checkpoint_path}")
+    else:
+        _do_save()
+        
 def clean_checkpoints(path_to_models='logs/44k/', n_ckpts_to_keep=2, sort_by_time=True):
   """Freeing up space by deleting saved ckpts
 

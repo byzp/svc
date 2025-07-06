@@ -2,6 +2,8 @@
 
 此分支的readme仅记录一些琐碎的改动
 
+<font color="red">存在未修复的异常, 请勿用于训练</font>
+
 #### change
 
 重写webui, 仅保留推理功能
