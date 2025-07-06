@@ -222,7 +222,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
         
-        loss_disc_all = loss_disc_all accum_steps
+        loss_disc_all = loss_disc_all / accum_steps
         if up_optim:
             scaler.scale(loss_disc_all).backward()
         else:
@@ -251,7 +251,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                 loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
         # —— 2）Gen forward / backward —— 
-        loss_gen_all = loss_gen_all accum_steps
+        loss_gen_all = loss_gen_all / accum_steps
         if up_optim:
             scaler.scale(loss_gen_all).backward()
         else:
