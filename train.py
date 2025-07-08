@@ -176,8 +176,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     net_g.train()
     net_d.train()
-    optim_d.zero_grad()
-    optim_g.zero_grad()
+    #optim_d.zero_grad()
+    #optim_g.zero_grad()
     
     for batch_idx, items in enumerate(train_loader):
         c, f0, spec, y, spk, lengths, uv,volume = items
@@ -234,12 +234,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             scaler.unscale_(optim_d)
             grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
             scaler.step(optim_d)
-            scaler.update() # 不在 discriminator 更新里调用，交给 generator 完成
+            #scaler.update() # 不在 discriminator 更新里调用，交给 generator 完成
             optim_d.zero_grad()
 
         # 冻结d
+        """
         for p in net_d.parameters():
             p.requires_grad = False
+        """
         with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
@@ -258,8 +260,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             with net_g.no_sync():
                 scaler.scale(loss_gen_all).backward()
         # 解冻d
+        """
         for p in net_d.parameters():
             p.requires_grad = True
+        """
 
         if up_optim:
             scaler.unscale_(optim_g)
