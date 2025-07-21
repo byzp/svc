@@ -2,16 +2,37 @@ import logging
 import multiprocessing
 import os
 import time
+import signal
+import sys
+import os
+import threading
 
 import torch
+
+# 启用 SDPA 优化，使用 Flash kernel
+if hasattr(torch.backends.cuda, 'sdp_kernel'):
+    torch.backends.cuda.sdp_enabled = True
+    torch.backends.cuda.sdp_kernel = "flash"
+
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+"""
+# === xFormers patch start ===
+import xformers.ops as xops
+from torch.nn import MultiheadAttention
 
+def _patched_mha_forward(self, query, key, value, **kwargs):
+    # memory_efficient_attention 返回 (attn_output, None)
+    return xops.memory_efficient_attention(query, key, value), None
+
+MultiheadAttention.forward = _patched_mha_forward
+# === xFormers patch end ===
+"""
 import modules.commons as commons
 import utils
 from data_utils import TextAudioCollate, TextAudioSpeakerLoader
@@ -25,12 +46,17 @@ from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('numba').setLevel(logging.WARNING)
 
-torch.backends.cudnn.benchmark = True
+terminate_flag = threading.Event()
+
 global_step = 0
 start_time = time.time()
 
 # os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'INFO'
 
+torch.set_float32_matmul_precision('high')  # 加速矩阵乘法
+torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32矩阵乘法
+torch.backends.cudnn.allow_tf32 = True  # 允许TF32卷积
+torch.backends.cudnn.benchmark = True  # 加速卷积运算
 
 def main():
     """Assume Single Node Multi GPUs Training Only"""
@@ -63,7 +89,7 @@ def run(rank, n_gpus, hps):
     num_workers = 5 if multiprocessing.cpu_count() > 4 else multiprocessing.cpu_count()
     if all_in_mem:
         num_workers = 0
-    train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True,
+    train_loader = DataLoader(train_dataset, num_workers=num_workers, shuffle=False, pin_memory=True, persistent_workers=True, prefetch_factor=hps.train.batch_size*4,
                               batch_size=hps.train.batch_size, collate_fn=collate_fn)
     if rank == 0:
         eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files, hps, all_in_mem=all_in_mem,vol_aug = False)
@@ -88,6 +114,7 @@ def run(rank, n_gpus, hps):
         eps=hps.train.eps)
     net_g = DDP(net_g, device_ids=[rank])  # , find_unused_parameters=True)
     net_d = DDP(net_d, device_ids=[rank])
+
 
     skip_optimizer = False
     try:
@@ -140,6 +167,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     if writers is not None:
         writer, writer_eval = writers
     
+    accum_steps = getattr(hps.train, "grad_accumulate", 1)
+    
     half_type = torch.bfloat16 if hps.train.half_type=="bf16" else torch.float16
 
     # train_loader.batch_sampler.set_epoch(epoch)
@@ -147,6 +176,9 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     net_g.train()
     net_d.train()
+    #optim_d.zero_grad()
+    #optim_g.zero_grad()
+    
     for batch_idx, items in enumerate(train_loader):
         c, f0, spec, y, spk, lengths, uv,volume = items
         g = spk.cuda(rank, non_blocking=True)
@@ -163,7 +195,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             hps.data.mel_fmin,
             hps.data.mel_fmax)
         
-        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+        up_optim=(batch_idx + 1) % accum_steps == 0
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             y_hat, ids_slice, z_mask, \
             (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0 = net_g(c, f0, uv, spec, g=g, c_lengths=lengths,
                                                                                 spec_lengths=lengths,vol = volume)
@@ -182,40 +215,74 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
             y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)  # slice
 
             # Discriminator
+            # —— 1）Disc forward / backward —— 
             y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
 
-            with autocast(enabled=False, dtype=half_type):
+            with autocast(enabled=False, dtype=half_type,device_type='cuda'):
                 loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
                 loss_disc_all = loss_disc
         
-        optim_d.zero_grad()
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
-        
+        loss_disc_all = loss_disc_all #/ accum_steps
+        if up_optim:
+            scaler.scale(loss_disc_all).backward()
+        else:
+            with net_d.no_sync():
+                scaler.scale(loss_disc_all).backward()
 
-        with autocast(enabled=hps.train.fp16_run, dtype=half_type):
+        # 只有当累积步数到达时，才实际更新 D
+        if up_optim:
+            scaler.unscale_(optim_d)
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            scaler.step(optim_d)
+            #scaler.update() # 不在 discriminator 更新里调用，交给 generator 完成
+            optim_d.zero_grad()
+
+        # 冻结d
+        """
+        for p in net_d.parameters():
+            p.requires_grad = False
+        """
+        with autocast(enabled=hps.train.fp16_run, dtype=half_type,device_type='cuda'):
             # Generator
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
-            with autocast(enabled=False, dtype=half_type):
+            with autocast(enabled=False, dtype=half_type,device_type='cuda'):
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
                 loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_lf0 = F.mse_loss(pred_lf0, lf0) if net_g.module.use_automatic_f0_prediction else 0
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_lf0
-        optim_g.zero_grad()
-        scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+        # —— 2）Gen forward / backward —— 
+        loss_gen_all = loss_gen_all #/ accum_steps
+        if up_optim:
+            scaler.scale(loss_gen_all).backward()
+        else:
+            with net_g.no_sync():
+                scaler.scale(loss_gen_all).backward()
+        # 解冻d
+        """
+        for p in net_d.parameters():
+            p.requires_grad = True
+        """
+
+        if up_optim:
+            scaler.unscale_(optim_g)
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
+            scaler.update()
+            optim_g.zero_grad()
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]['lr']
                 losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
+                """
+                losses = [loss_disc * accum_steps,
+                    loss_gen  * accum_steps,
+                    loss_fm   * accum_steps,
+                    loss_mel  * accum_steps,
+                    loss_kl   * accum_steps]
+                """
                 reference_loss=0
                 for i in losses:
                     reference_loss += i
@@ -223,47 +290,63 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
                     epoch,
                     100. * batch_idx / len(train_loader)))
                 logger.info(f"Losses: {[x.item() for x in losses]}, step: {global_step}, lr: {lr}, reference_loss: {reference_loss}")
-
-                scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr,
-                               "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
-                scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/kl": loss_kl,
-                                    "loss/g/lf0": loss_lf0})
-
-                # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
-                # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
-                # scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
-                image_dict = {
-                    "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
-                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
-                    "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
-                }
-
-                if net_g.module.use_automatic_f0_prediction:
-                    image_dict.update({
-                        "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                              pred_lf0[0, 0, :].detach().cpu().numpy()),
-                        "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
-                                                                   norm_lf0[0, 0, :].detach().cpu().numpy())
+                if "grad_norm_d" in locals():
+                    scalar_dict = {
+                        "loss/g/total": loss_gen_all, #* accum_steps,
+                        "loss/d/total": loss_disc_all, #* accum_steps,
+                        "learning_rate": lr,
+                        "grad_norm_d": grad_norm_d,
+                        "grad_norm_g": grad_norm_g,
+                    }
+                    scalar_dict.update({
+                        "loss/g/fm": loss_fm, #* accum_steps,
+                        "loss/g/mel": loss_mel, #* accum_steps,
+                        "loss/g/kl": loss_kl, #* accum_steps,
+                        "loss/g/lf0": loss_lf0, #* accum_steps
                     })
 
-                utils.summarize(
-                    writer=writer,
-                    global_step=global_step,
-                    images=image_dict,
-                    scalars=scalar_dict
-                )
+                    # scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
+                    # scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
+                    # scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
+                    image_dict = {
+                        "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
+                        "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
+                        "all/mel": utils.plot_spectrogram_to_numpy(mel[0].data.cpu().numpy())
+                    }
 
-            if global_step % hps.train.eval_interval == 0:
+                    if net_g.module.use_automatic_f0_prediction:
+                        image_dict.update({
+                            "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                                  pred_lf0[0, 0, :].detach().cpu().numpy()),
+                            "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                                                       norm_lf0[0, 0, :].detach().cpu().numpy())
+                        })
+
+                    utils.summarize(
+                        writer=writer,
+                        global_step=global_step,
+                        images=image_dict,
+                        scalars=scalar_dict
+                    )
+            
+            if global_step % hps.train.eval_interval == 0 and global_step != 0: # 不保存G_0.pth和D_0.pth
                 evaluate(hps, net_g, eval_loader, writer_eval)
                 utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
+                                      os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
+                                      Async=True)
                 utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
-                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
+                                      os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
+                                      Async=True)
                 keep_ckpts = getattr(hps.train, 'keep_ckpts', 0)
                 if keep_ckpts > 0:
                     utils.clean_checkpoints(path_to_models=hps.model_dir, n_ckpts_to_keep=keep_ckpts, sort_by_time=True)
 
         global_step += 1
+        
+        if terminate_flag.is_set() and up_optim:
+            save_model_on_exit(rank, hps, net_g, net_d, optim_g, optim_d, epoch)
+            sys.exit(0)
+
 
     if rank == 0:
         global start_time
@@ -277,7 +360,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     generator.eval()
     image_dict = {}
     audio_dict = {}
-    with torch.no_grad():
+    with torch.inference_mode(): # 比torch.no_grad()快一点
         for batch_idx, items in enumerate(eval_loader):
             c, f0, spec, y, spk, _, uv,volume = items
             g = spk[:1].cuda(0)
@@ -324,6 +407,24 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     )
     generator.train()
 
+def save_model_on_exit(rank, hps, net_g, net_d, optim_g, optim_d, epoch):
+    if rank == 0:
+        print("\n[INFO] Saving model before exiting...")
+        from utils import save_checkpoint  # 延迟导入防止循环
+        save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch,
+                        os.path.join(hps.model_dir, f"G_{global_step}.pth"))
+        save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch,
+                        os.path.join(hps.model_dir, f"D_{global_step}.pth"))
+
+def handle_sigint(signum, frame):
+    if not terminate_flag.is_set():
+        print("\n[INFO] Received Ctrl+C, will save and exit after current iteration. Press again to force exit.")
+        terminate_flag.set()
+    else:
+        print("\n[INFO] Forced termination.")
+        sys.exit(1)
+
+signal.signal(signal.SIGINT, handle_sigint)
 
 if __name__ == "__main__":
     main()
