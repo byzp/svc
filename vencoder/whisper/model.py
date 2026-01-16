@@ -1,5 +1,8 @@
+import base64
+import gzip
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -8,6 +11,15 @@ from torch import Tensor, nn
 
 from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
+from .transcribe import transcribe as transcribe_function
+
+try:
+    from torch.nn.functional import scaled_dot_product_attention
+
+    SDPA_AVAILABLE = True
+except (ImportError, RuntimeError, OSError):
+    scaled_dot_product_attention = None
+    SDPA_AVAILABLE = False
 
 
 @dataclass
@@ -32,12 +44,16 @@ class LayerNorm(nn.LayerNorm):
 class Linear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         return F.linear(
-            x, self.weight.to(x.dtype), None if self.bias is None else self.bias.to(x.dtype)
+            x,
+            self.weight.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype),
         )
 
 
 class Conv1d(nn.Conv1d):
-    def _conv_forward(self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    def _conv_forward(
+        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
+    ) -> Tensor:
         return super()._conv_forward(
             x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
         )
@@ -52,7 +68,19 @@ def sinusoids(length, channels, max_timescale=10000):
     return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
+@contextmanager
+def disable_sdpa():
+    prev_state = MultiHeadAttention.use_sdpa
+    try:
+        MultiHeadAttention.use_sdpa = False
+        yield
+    finally:
+        MultiHeadAttention.use_sdpa = prev_state
+
+
 class MultiHeadAttention(nn.Module):
+    use_sdpa = True
+
     def __init__(self, n_state: int, n_head: int):
         super().__init__()
         self.n_head = n_head
@@ -83,20 +111,32 @@ class MultiHeadAttention(nn.Module):
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk
 
-    def qkv_attention(self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None):
+    def qkv_attention(
+        self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n_batch, n_ctx, n_state = q.shape
         scale = (n_state // self.n_head) ** -0.25
-        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3) * scale
-        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 3, 1) * scale
+        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
-        qk = q @ k
-        if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
-        qk = qk.float()
+        if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
+            a = scaled_dot_product_attention(
+                q, k, v, is_causal=mask is not None and n_ctx > 1
+            )
+            out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = None
+        else:
+            qk = (q * scale) @ (k * scale).transpose(-1, -2)
+            if mask is not None:
+                qk = qk + mask[:n_ctx, :n_ctx]
+            qk = qk.float()
 
-        w = F.softmax(qk, dim=-1).to(q.dtype)
-        return (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2), qk.detach()
+            w = F.softmax(qk, dim=-1).to(q.dtype)
+            out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
+            qk = qk.detach()
+
+        return out, qk
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -106,11 +146,15 @@ class ResidualAttentionBlock(nn.Module):
         self.attn = MultiHeadAttention(n_state, n_head)
         self.attn_ln = LayerNorm(n_state)
 
-        self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attention else None
+        self.cross_attn = (
+            MultiHeadAttention(n_state, n_head) if cross_attention else None
+        )
         self.cross_attn_ln = LayerNorm(n_state) if cross_attention else None
 
         n_mlp = n_state * 4
-        self.mlp = nn.Sequential(Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state))
+        self.mlp = nn.Sequential(
+            Linear(n_state, n_mlp), nn.GELU(), Linear(n_mlp, n_state)
+        )
         self.mlp_ln = LayerNorm(n_state)
 
     def forward(
@@ -128,7 +172,9 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    def __init__(
+        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
         super().__init__()
         self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
@@ -148,11 +194,8 @@ class AudioEncoder(nn.Module):
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
 
-        len_x = x.shape[1]
-        len_e = self.positional_embedding.shape[0]
-        assert len_x <= len_e, "incorrect audio shape"
-        pos_e = self.positional_embedding[:len_x, :]
-        x = (x + pos_e).to(x.dtype)
+        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+        x = (x + self.positional_embedding).to(x.dtype)
 
         for block in self.blocks:
             x = block(x)
@@ -162,14 +205,19 @@ class AudioEncoder(nn.Module):
 
 
 class TextDecoder(nn.Module):
-    def __init__(self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int):
+    def __init__(
+        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
         super().__init__()
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.positional_embedding = nn.Parameter(torch.empty(n_ctx, n_state))
 
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head, cross_attention=True) for _ in range(n_layer)]
+            [
+                ResidualAttentionBlock(n_state, n_head, cross_attention=True)
+                for _ in range(n_layer)
+            ]
         )
         self.ln = LayerNorm(n_state)
 
@@ -180,18 +228,23 @@ class TextDecoder(nn.Module):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
-        xa : torch.Tensor, shape = (batch_size, n_mels, n_audio_ctx)
+        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
         """
         offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
-        x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+        x = (
+            self.token_embedding(x)
+            + self.positional_embedding[offset : offset + x.shape[-1]]
+        )
         x = x.to(xa.dtype)
 
         for block in self.blocks:
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln(x)
-        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+        logits = (
+            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
+        ).float()
 
         return logits
 
@@ -214,6 +267,22 @@ class Whisper(nn.Module):
             self.dims.n_text_head,
             self.dims.n_text_layer,
         )
+        # use the last half among the decoder layers for time alignment by default;
+        # to use a specific set of heads, see `set_alignment_heads()` below.
+        all_heads = torch.zeros(
+            self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
+        )
+        all_heads[self.dims.n_text_layer // 2 :] = True
+        self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
+
+    def set_alignment_heads(self, dump: bytes):
+        array = np.frombuffer(
+            gzip.decompress(base64.b85decode(dump)), dtype=bool
+        ).copy()
+        mask = torch.from_numpy(array).reshape(
+            self.dims.n_text_layer, self.dims.n_text_head
+        )
+        self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
 
     def embed_audio(self, mel: torch.Tensor):
         return self.encoder(mel)
@@ -221,7 +290,9 @@ class Whisper(nn.Module):
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
         return self.decoder(tokens, audio_features)
 
-    def forward(self, mel: torch.Tensor, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self, mel: torch.Tensor, tokens: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
         return self.decoder(tokens, self.encoder(mel))
 
     @property
@@ -230,7 +301,11 @@ class Whisper(nn.Module):
 
     @property
     def is_multilingual(self):
-        return self.dims.n_vocab == 51865
+        return self.dims.n_vocab >= 51865
+
+    @property
+    def num_languages(self):
+        return self.dims.n_vocab - 51765 - int(self.is_multilingual)
 
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
         """
@@ -250,8 +325,9 @@ class Whisper(nn.Module):
         hooks = []
 
         def save_to_cache(module, _, output):
-            if module not in cache or output.shape[1] > self.decoder.positional_embedding.shape[0]:
-                cache[module] = output  # save as-is, for the first token or cross attention
+            if module not in cache or output.shape[1] > self.dims.n_text_ctx:
+                # save as-is, for the first token or cross attention
+                cache[module] = output
             else:
                 cache[module] = torch.cat([cache[module], output], dim=1).detach()
             return cache[module]
@@ -265,4 +341,5 @@ class Whisper(nn.Module):
         return cache, hooks
 
     detect_language = detect_language_function
+    transcribe = transcribe_function
     decode = decode_function

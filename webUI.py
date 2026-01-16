@@ -93,9 +93,15 @@ with gr.Blocks() as demo:
         diffusion_config_path = gr.Textbox("logs/44k/diffusion/config.yaml", label="扩散配置")
 
     with gr.Row():
-        uploaded_files = gr.File(file_count="multiple", label="上传音频文件")
+        #uploaded_files = gr.File(file_count="single", label="上传音频文件")
+        uploaded_files = gr.File(
+    file_count="multiple",
+    file_types=[".wav", ".mp3", ".m4a", ".aac", ".ogg"],
+    label="上传音频文件（可多选）"
+)
+
         trans = gr.Textbox("0", label="音高变化（半音） 空格分隔，对应每个文件")
-        spk_list = gr.Textbox("cabbage", label="目标说话人 空格分隔")
+        spk_list = gr.Textbox("female", label="目标说话人 空格分隔")
 
     with gr.Row():
         clip = gr.Number(0, label="强制切片/s（0为自动）")
@@ -139,5 +145,5 @@ with gr.Blocks() as demo:
     ], outputs=output)
 
 if __name__ == '__main__':
-    os.system("start http://127.0.0.1:7860")
-    demo.launch()
+    #os.system("start http://127.0.0.1:7860")
+    demo.launch(server_name="0.0.0.0")
