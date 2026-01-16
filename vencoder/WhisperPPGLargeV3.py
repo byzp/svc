@@ -1,23 +1,42 @@
 import torch
 import torchaudio
+import bitsandbytes as bnb
 
 from vencoder.encoder import SpeechEncoder
 from vencoder.whisper.audio import log_mel_spectrogram, pad_or_trim
 from vencoder.whisper.model import ModelDimensions
 from vencoder.whisper.model import AudioEncoder
+import torch.nn as nn
+
+
+def convert_linear_to_int4(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            int4_linear = bnb.nn.Linear4bit(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                compute_dtype=torch.float16,
+                quant_type="nf4",
+                compress_statistics=True
+            )
+            int4_linear.weight.data = child.weight.data
+            if child.bias is not None:
+                int4_linear.bias.data = child.bias.data
+            setattr(module, name, int4_linear)
+        else:
+            convert_linear_to_int4(child)
 
 
 class WhisperPPGLargeV3(SpeechEncoder):
-    def __init__(self, vec_path="pretrain/large-v3.pt", device=None):
+    def __init__(self, vec_path="pretrain/large-v3.pt", device="cuda"):
         super().__init__()
 
-        if device is None:
-            self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.dev = torch.device(device)
+        self.dev = torch.device(device)
 
         checkpoint = torch.load(vec_path, map_location="cpu")
-        dims = ModelDimensions(**checkpoint["dims"])  # n_mels=128
+        dims = ModelDimensions(**checkpoint["dims"])
+
         self.model = AudioEncoder(
             n_mels=dims.n_mels,
             n_ctx=dims.n_audio_ctx,
@@ -31,12 +50,10 @@ class WhisperPPGLargeV3(SpeechEncoder):
             if k.startswith("encoder.")
         }
         self.model.load_state_dict(encoder_state, strict=True)
+        convert_linear_to_int4(self.model)
         self.model.eval()
         self.model.to(self.dev)
         self.hidden_dim = dims.n_audio_state
-        if self.dev.type == "cuda":
-            self.model = self.model.half()
-
 
     def encoder(self, wav):
         audio = wav
