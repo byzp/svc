@@ -537,4 +537,3 @@ class SynthesizerTrn(nn.Module):
         z = self.flow(z_p, c_mask, g=g, reverse=True)
         o = self.dec(z * c_mask, g=g, f0=f0)
         return o,f0
-

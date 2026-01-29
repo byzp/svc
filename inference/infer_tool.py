@@ -212,8 +212,8 @@ class Svc(object):
         spk_mix_enable=False,
         feature_retrieval=False,
         precision: Literal["fp32", "fp16", "int8", "int4"] = "fp16",
-        encoder_device: Optional[str] = "cuda:0",
-        vits_device: Optional[str] = "cuda:0",
+        encoder_device: Optional[str] = None,
+        vits_device: Optional[str] = None,
         enable_pipeline: bool = True,
         pipeline_queue_size: int = 1024,
     ):

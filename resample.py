@@ -7,10 +7,11 @@ from multiprocessing import cpu_count
 import librosa
 import numpy as np
 from rich.progress import track
-from scipy.io import wavfile
+import soundfile as sf
 
 
 def load_wav(wav_path):
+    # keep default mono=True; if you want to preserve channels use mono=False
     return librosa.load(wav_path, sr=None)
 
 
@@ -20,7 +21,7 @@ def trim_wav(wav, top_db=40):
 
 def normalize_peak(wav, threshold=1.0):
     peak = np.abs(wav).max()
-    if peak > threshold:
+    if peak > threshold and peak > 0:
         wav = 0.98 * wav / peak
     return wav
 
@@ -30,11 +31,15 @@ def resample_wav(wav, sr, target_sr):
 
 
 def save_wav_to_path(wav, save_path, sr):
-    wavfile.write(
-        save_path,
-        sr,
-        (wav * np.iinfo(np.int16).max).astype(np.int16)
-    )
+    """
+    Use soundfile.write so that output format is derived from filename extension.
+    soundfile accepts float arrays in range [-1, 1]. If the user wants specific
+    PCM subtype they can change the call (e.g. subtype='PCM_16').
+    """
+    # ensure float32 for soundfile
+    wav_to_write = wav.astype(np.float32)
+    # soundfile will infer format from extension ('.wav', '.flac', etc.)
+    sf.write(save_path, wav_to_write, sr)
 
 
 def process(item):
@@ -42,7 +47,8 @@ def process(item):
     speaker = spkdir.replace("\\", "/").split("/")[-1]
 
     wav_path = os.path.join(args.in_dir, speaker, wav_name)
-    if os.path.exists(wav_path) and '.wav' in wav_path:
+    # only accept .wav or .flac (case-insensitive)
+    if os.path.exists(wav_path) and wav_path.lower().endswith(('.wav', '.flac')):
         os.makedirs(os.path.join(args.out_dir2, speaker), exist_ok=True)
 
         wav, sr = load_wav(wav_path)
@@ -51,26 +57,13 @@ def process(item):
         resampled_wav = resample_wav(wav, sr, args.sr2)
 
         if not args.skip_loudnorm:
-            resampled_wav /= np.max(np.abs(resampled_wav))
+            denom = np.max(np.abs(resampled_wav))
+            if denom > 0:
+                resampled_wav = resampled_wav / denom
 
+        # preserve original extension for output (so .flac -> .flac, .wav -> .wav)
         save_path2 = os.path.join(args.out_dir2, speaker, wav_name)
         save_wav_to_path(resampled_wav, save_path2, args.sr2)
-
-
-"""
-def process_all_speakers():
-    process_count = 30 if os.cpu_count() > 60 else (os.cpu_count() - 2 if os.cpu_count() > 4 else 1)
-
-    with ThreadPoolExecutor(max_workers=process_count) as executor:
-        for speaker in speakers:
-            spk_dir = os.path.join(args.in_dir, speaker)
-            if os.path.isdir(spk_dir):
-                print(spk_dir)
-                futures = [executor.submit(process, (spk_dir, i, args)) for i in os.listdir(spk_dir) if i.endswith("wav")]
-                for _ in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
-                    pass
-"""
-# multi process
 
 
 def process_all_speakers():
@@ -80,7 +73,9 @@ def process_all_speakers():
             spk_dir = os.path.join(args.in_dir, speaker)
             if os.path.isdir(spk_dir):
                 print(spk_dir)
-                futures = [executor.submit(process, (spk_dir, i, args)) for i in os.listdir(spk_dir) if i.endswith("wav")]
+                # list only wav/flac files (case-insensitive)
+                files = [f for f in os.listdir(spk_dir) if f.lower().endswith(('.wav', '.flac'))]
+                futures = [executor.submit(process, (spk_dir, i, args)) for i in files]
                 for _ in track(concurrent.futures.as_completed(futures), total=len(futures), description="resampling:"):
                     pass
 

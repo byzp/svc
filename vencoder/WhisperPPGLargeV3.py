@@ -60,7 +60,11 @@ class WhisperPPGLargeV3(SpeechEncoder):
         audln = audio.shape[0]
         ppgln = audln // 320
         audio = pad_or_trim(audio)
-        mel = log_mel_spectrogram(audio, 128).to(self.dev).float()  # uses n_mels=128 internally
+
+        mel_cpu = log_mel_spectrogram(audio, 128) # uses n_mels=128 internally
+        mel = mel_cpu.to(self.dev, non_blocking=True).float()
+        #torch.cuda.synchronize()
+        del mel_cpu
         with torch.no_grad(), torch.amp.autocast("cuda",enabled=True):
             # FP16，自动混合精度
             ppg = self.model(mel.unsqueeze(0)).squeeze()
