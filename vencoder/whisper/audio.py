@@ -1,13 +1,11 @@
 import os
 from functools import lru_cache
-from subprocess import CalledProcessError, run
 from typing import Optional, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .utils import exact_div
 
 # hard-coded audio hyperparameters
 SAMPLE_RATE = 16000
@@ -15,51 +13,13 @@ N_FFT = 400
 HOP_LENGTH = 160
 CHUNK_LENGTH = 30
 N_SAMPLES = CHUNK_LENGTH * SAMPLE_RATE  # 480000 samples in a 30-second chunk
-N_FRAMES = exact_div(N_SAMPLES, HOP_LENGTH)  # 3000 frames in a mel spectrogram input
+N_FRAMES = N_SAMPLES // HOP_LENGTH  # 3000 frames in a mel spectrogram input
 
 N_SAMPLES_PER_TOKEN = HOP_LENGTH * 2  # the initial convolutions has stride 2
-FRAMES_PER_SECOND = exact_div(SAMPLE_RATE, HOP_LENGTH)  # 10ms per audio frame
-TOKENS_PER_SECOND = exact_div(SAMPLE_RATE, N_SAMPLES_PER_TOKEN)  # 20ms per audio token
+FRAMES_PER_SECOND = SAMPLE_RATE // HOP_LENGTH  # 10ms per audio frame
+TOKENS_PER_SECOND = SAMPLE_RATE // N_SAMPLES_PER_TOKEN  # 20ms per audio token
 
 
-def load_audio(file: str, sr: int = SAMPLE_RATE):
-    """
-    Open an audio file and read as mono waveform, resampling as necessary
-
-    Parameters
-    ----------
-    file: str
-        The audio file to open
-
-    sr: int
-        The sample rate to resample the audio if necessary
-
-    Returns
-    -------
-    A NumPy array containing the audio waveform, in float32 dtype.
-    """
-
-    # This launches a subprocess to decode audio while down-mixing
-    # and resampling as necessary.  Requires the ffmpeg CLI in PATH.
-    # fmt: off
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-threads", "0",
-        "-i", file,
-        "-f", "s16le",
-        "-ac", "1",
-        "-acodec", "pcm_s16le",
-        "-ar", str(sr),
-        "-"
-    ]
-    # fmt: on
-    try:
-        out = run(cmd, capture_output=True, check=True).stdout
-    except CalledProcessError as e:
-        raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
-
-    return np.frombuffer(out, np.int16).flatten().astype(np.float32) / 32768.0
 
 
 def pad_or_trim(array, length: int = N_SAMPLES, *, axis: int = -1):
@@ -108,7 +68,7 @@ def mel_filters(device, n_mels: int) -> torch.Tensor:
 
 
 def log_mel_spectrogram(
-    audio: Union[str, np.ndarray, torch.Tensor],
+    audio: Union[np.ndarray, torch.Tensor],
     n_mels: int = 80,
     padding: int = 0,
     device: Optional[Union[str, torch.device]] = None,
@@ -118,7 +78,7 @@ def log_mel_spectrogram(
 
     Parameters
     ----------
-    audio: Union[str, np.ndarray, torch.Tensor], shape = (*)
+    audio: Union[np.ndarray, torch.Tensor], shape = (*)
         The path to audio or either a NumPy array or Tensor containing the audio waveform in 16 kHz
 
     n_mels: int
@@ -136,8 +96,6 @@ def log_mel_spectrogram(
         A Tensor that contains the Mel spectrogram
     """
     if not torch.is_tensor(audio):
-        if isinstance(audio, str):
-            audio = load_audio(audio)
         audio = torch.from_numpy(audio)
 
     if device is not None:

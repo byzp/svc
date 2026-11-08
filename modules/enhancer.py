@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchaudio.transforms import Resample
+from modules.F0Predictor.audio import resample_audio
 
 from vdecoder.nsf_hifigan.models import load_model
 from vdecoder.nsf_hifigan.nvSTFT import STFT
@@ -18,7 +18,6 @@ class Enhancer:
         else:
             raise ValueError(f" [x] Unknown enhancer: {enhancer_type}")
         
-        self.resample_kernel = {}
         self.enhancer_sample_rate = self.enhancer.sample_rate()
         self.enhancer_hop_size = self.enhancer.hop_size()
         
@@ -39,21 +38,20 @@ class Enhancer:
         # adaptive parameters
         adaptive_factor = 2 ** ( -adaptive_key / 12)
         adaptive_sample_rate = 100 * int(np.round(self.enhancer_sample_rate / adaptive_factor / 100))
+        if adaptive_sample_rate <= 0:
+            raise ValueError("enhancer_adaptive_key produces an invalid sample rate")
         real_factor = self.enhancer_sample_rate / adaptive_sample_rate
         
         # resample the ddsp output
         if sample_rate == adaptive_sample_rate:
             audio_res = audio
         else:
-            key_str = str(sample_rate) + str(adaptive_sample_rate)
-            if key_str not in self.resample_kernel:
-                self.resample_kernel[key_str] = Resample(sample_rate, adaptive_sample_rate, lowpass_filter_width = 128).to(self.device)
-            audio_res = self.resample_kernel[key_str](audio)
+            audio_res = resample_audio(audio, sample_rate, adaptive_sample_rate)
         
         n_frames = int(audio_res.size(-1) // self.enhancer_hop_size + 1)
         
         # resample f0
-        f0_np = f0.squeeze(0).squeeze(-1).cpu().numpy()
+        f0_np = f0.squeeze(0).squeeze(-1).float().cpu().numpy().copy()
         f0_np *= real_factor
         time_org = (hop_size / sample_rate) * np.arange(len(f0_np)) / real_factor
         time_frame = (self.enhancer_hop_size / self.enhancer_sample_rate) * np.arange(n_frames)
@@ -64,11 +62,8 @@ class Enhancer:
         enhanced_audio, enhancer_sample_rate = self.enhancer(audio_res, f0_res)
         
         # resample the enhanced output
-        if adaptive_factor != 0:
-            key_str = str(adaptive_sample_rate) + str(enhancer_sample_rate)
-            if key_str not in self.resample_kernel:
-                self.resample_kernel[key_str] = Resample(adaptive_sample_rate, enhancer_sample_rate, lowpass_filter_width = 128).to(self.device)
-            enhanced_audio =  self.resample_kernel[key_str](enhanced_audio)
+        if adaptive_sample_rate != enhancer_sample_rate:
+            enhanced_audio = resample_audio(enhanced_audio, adaptive_sample_rate, enhancer_sample_rate)
         
         # pad the silence frames
         if start_frame > 0:

@@ -9,7 +9,7 @@ def feature_loss(fmap_r, fmap_g):
       gl = gl.float()
       loss += torch.mean(torch.abs(rl - gl))
 
-  return loss * 2 
+  return loss * 2
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):

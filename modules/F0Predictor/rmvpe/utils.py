@@ -62,46 +62,29 @@ def summary(model, file=sys.stdout):
 
     
 def to_local_average_cents(salience, center=None, thred=0.05):
-    """
-    find the weighted average cents near the argmax bin
-    """
+    """Average the nine bins around each peak, with device-local tensors."""
+    if salience.ndim not in (1, 2):
+        raise ValueError("salience must be 1D or 2D")
+    single = salience.ndim == 1
+    values = salience[None] if single else salience
+    values = values.float()
+    bins = torch.arange(values.shape[-1], device=values.device)
+    if center is None:
+        center = values.argmax(dim=-1)
+    else:
+        center = torch.as_tensor(center, device=values.device).reshape(-1)
+    weights = values * ((bins[None] - center[:, None]).abs() <= 4)
+    mapping = 20 * bins + CONST  # noqa: F405
+    cents = (weights * mapping).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1e-9)
+    cents = torch.where(weights.max(dim=-1).values > thred, cents, 0)
+    return cents[0] if single else cents
 
-    if not hasattr(to_local_average_cents, 'cents_mapping'):
-        # the bin number-to-cents mapping
-        to_local_average_cents.cents_mapping = (
-                20 * torch.arange(N_CLASS) + CONST).to(salience.device)  # noqa: F405
-
-    if salience.ndim == 1:
-        if center is None:
-            center = int(torch.argmax(salience))
-        start = max(0, center - 4)
-        end = min(len(salience), center + 5)
-        salience = salience[start:end]
-        product_sum = torch.sum(
-            salience * to_local_average_cents.cents_mapping[start:end])
-        weight_sum = torch.sum(salience)
-        return product_sum / weight_sum if torch.max(salience) > thred else 0
-    if salience.ndim == 2:
-        return torch.Tensor([to_local_average_cents(salience[i, :], None, thred) for i in
-                         range(salience.shape[0])]).to(salience.device)
-
-    raise Exception("label should be either 1d or 2d ndarray")
 
 def to_viterbi_cents(salience, thred=0.05):
-    # Create viterbi transition matrix
-    if not hasattr(to_viterbi_cents, 'transition'):
-        xx, yy = torch.meshgrid(range(N_CLASS), range(N_CLASS))  # noqa: F405
-        transition = torch.maximum(30 - abs(xx - yy), 0)
-        transition = transition / transition.sum(axis=1, keepdims=True)
-        to_viterbi_cents.transition = transition
-
-    # Convert to probability
-    prob = salience.T
-    prob = prob / prob.sum(axis=0)    
-
-    # Perform viterbi decoding
-    path = librosa.sequence.viterbi(prob.detach().cpu().numpy(), to_viterbi_cents.transition).astype(np.int64)
-
-    return torch.Tensor([to_local_average_cents(salience[i, :], path[i], thred) for i in
-                     range(len(path))]).to(salience.device)
-                     
+    bins = np.arange(N_CLASS)  # noqa: F405
+    transition = np.maximum(30 - abs(bins[:, None] - bins[None, :]), 0).astype(float)
+    transition /= transition.sum(axis=1, keepdims=True)
+    prob = salience.float().T
+    prob = prob / prob.sum(dim=0, keepdim=True).clamp_min(1e-9)
+    path = librosa.sequence.viterbi(prob.detach().cpu().numpy(), transition).astype(np.int64)
+    return to_local_average_cents(salience, center=path, thred=thred)

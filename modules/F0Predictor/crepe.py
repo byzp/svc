@@ -6,7 +6,8 @@ except Exception:
     from typing_extensions import Literal
 import numpy as np
 import torch
-import torchcrepe
+from .crepe_backend import CrepeInference, silence_mask
+from .F0Predictor import F0Predictor
 from torch import nn
 from torch.nn import functional as F
 
@@ -88,28 +89,7 @@ class BasePitchExtractor:
         if self.keep_zeros:
             return f0
         
-        vuv_vector = torch.zeros_like(f0)
-        vuv_vector[f0 > 0.0] = 1.0
-        vuv_vector[f0 <= 0.0] = 0.0
-        
-        # 去掉0频率, 并线性插值
-        nzindex = torch.nonzero(f0).squeeze()
-        f0 = torch.index_select(f0, dim=0, index=nzindex).cpu().numpy()
-        time_org = self.hop_length / sampling_rate * nzindex.cpu().numpy()
-        time_frame = np.arange(pad_to) * self.hop_length / sampling_rate
-        
-        vuv_vector = F.interpolate(vuv_vector[None,None,:],size=pad_to)[0][0]
-
-        if f0.shape[0] <= 0:
-            return torch.zeros(pad_to, dtype=torch.float, device=x.device),vuv_vector.cpu().numpy()
-        if f0.shape[0] == 1:
-            return torch.ones(pad_to, dtype=torch.float, device=x.device) * f0[0],vuv_vector.cpu().numpy()
-    
-        # 大概可以用 torch 重写?
-        f0 = np.interp(time_frame, time_org, f0, left=f0[0], right=f0[-1])
-        #vuv_vector = np.ceil(scipy.ndimage.zoom(vuv_vector,pad_to/len(vuv_vector),order = 0))
-        
-        return f0,vuv_vector.cpu().numpy()
+        return F0Predictor.interpolate_f0(f0.float().cpu().numpy())
 
 
 class MaskedAvgPool1d(nn.Module):
@@ -266,14 +246,6 @@ class CrepePitchExtractor(BasePitchExtractor):
         decoder="viterbi"
     ):
         super().__init__(hop_length, f0_min, f0_max, keep_zeros)
-        if decoder == "viterbi":
-            self.decoder = torchcrepe.decode.viterbi
-        elif decoder == "argmax":
-            self.decoder = torchcrepe.decode.argmax
-        elif decoder == "weighted_argmax":
-            self.decoder = torchcrepe.decode.weighted_argmax
-        else:
-            raise "Unknown decoder"
         self.threshold = threshold
         self.model = model
         self.use_fast_filters = use_fast_filters
@@ -282,9 +254,9 @@ class CrepePitchExtractor(BasePitchExtractor):
             self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         else:
             self.dev = torch.device(device)
-        if self.use_fast_filters:
-            self.median_filter = MaskedMedianPool1d(3, 1, 1).to(device)
-            self.mean_filter = MaskedAvgPool1d(3, 1, 1).to(device)
+        self.backend = CrepeInference(model, self.dev, decoder)
+        self.median_filter = MaskedMedianPool1d(3, 1, 1).to(self.dev)
+        self.mean_filter = MaskedAvgPool1d(3, 1, 1).to(self.dev)
 
     def __call__(self, x, sampling_rate=44100, pad_to=None):
         """Extract pitch using crepe.
@@ -303,38 +275,26 @@ class CrepePitchExtractor(BasePitchExtractor):
         assert x.shape[0] == 1, f"Expected 1 channel, got {x.shape[0]} channels."
 
         x = x.to(self.dev)
-        f0, pd = torchcrepe.predict(
-            x,
-            sampling_rate,
-            self.hop_length,
-            self.f0_min,
-            self.f0_max,
-            pad=True,
-            model=self.model,
-            batch_size=1024,
-            device=x.device,
-            return_periodicity=True,
-            decoder=self.decoder
-        )
+        f0, pd = self.backend(x, sampling_rate, self.hop_length, self.f0_min, self.f0_max)
 
         # Filter, remove silence, set uv threshold, refer to the original warehouse readme
         if self.use_fast_filters:
             pd = self.median_filter(pd)
         else:
-            pd = torchcrepe.filter.median(pd, 3)
+            pd = F.pad(pd, (1, 1), value=float("nan")).unfold(-1, 3, 1).nanmedian(dim=-1).values
 
-        pd = torchcrepe.threshold.Silence(-60.0)(pd, x, sampling_rate, self.hop_length)
-        f0 = torchcrepe.threshold.At(self.threshold)(f0, pd)
+        pd = pd.masked_fill(silence_mask(x, sampling_rate, self.hop_length), 0)
+        f0 = f0.masked_fill(pd < self.threshold, float("nan"))
         
         if self.use_fast_filters:
             f0 = self.mean_filter(f0)
         else:
-            f0 = torchcrepe.filter.mean(f0, 3)
+            f0 = F.pad(f0, (1, 1), value=float("nan")).unfold(-1, 3, 1).nanmean(dim=-1)
 
         f0 = torch.where(torch.isnan(f0), torch.full_like(f0, 0), f0)[0]
 
         if torch.all(f0 == 0):
-            rtn = f0.cpu().numpy() if pad_to is None else np.zeros(pad_to)
+            rtn = f0.cpu().numpy() if pad_to is None else np.zeros(pad_to, dtype=np.float32)
             return rtn,rtn
         
         return self.post_process(x, sampling_rate, f0, pad_to)

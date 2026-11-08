@@ -39,7 +39,7 @@ def save_wav_to_path(wav, save_path, sr):
     # ensure float32 for soundfile
     wav_to_write = wav.astype(np.float32)
     # soundfile will infer format from extension ('.wav', '.flac', etc.)
-    sf.write(save_path, wav_to_write, sr)
+    sf.write(save_path, wav_to_write, sr, subtype="PCM_16")
 
 
 def process(item):
@@ -61,8 +61,8 @@ def process(item):
             if denom > 0:
                 resampled_wav = resampled_wav / denom
 
-        # preserve original extension for output (so .flac -> .flac, .wav -> .wav)
-        save_path2 = os.path.join(args.out_dir2, speaker, wav_name)
+        # Normalize all output to PCM WAV for the training data loader.
+        save_path2 = os.path.join(args.out_dir2, speaker, os.path.splitext(wav_name)[0] + ".wav")
         save_wav_to_path(resampled_wav, save_path2, args.sr2)
 
 

@@ -1,123 +1,64 @@
 import argparse
 import json
-import os
-import re
+import random
 import wave
-from random import shuffle
+from pathlib import Path
 
-from loguru import logger
-from tqdm import tqdm
-
-import diffusion.logger.utils as du
-
-pattern = re.compile(r'^[\.a-zA-Z0-9_\/]+$')
 
 def get_wav_duration(file_path):
-    try:
-        with wave.open(file_path, 'rb') as wav_file:
-            # 获取音频帧数
-            n_frames = wav_file.getnframes()
-            # 获取采样率
-            framerate = wav_file.getframerate()
-            # 计算时长（秒）
-            return n_frames / float(framerate)
-    except Exception as e:
-        logger.error(f"Reading {file_path}")
-        raise e
+    with wave.open(str(file_path), "rb") as wav:
+        return wav.getnframes() / wav.getframerate()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create filelists using the existing Whisper large-v3 model configuration")
+    parser.add_argument("-c", "--config", default="configs/config.json")
+    parser.add_argument("--train_list", default=None)
+    parser.add_argument("--val_list", default=None)
+    parser.add_argument("--source_dir", default="dataset/44k")
+    parser.add_argument("--speech_encoder", choices=["whisper-ppg-large-v3"], default="whisper-ppg-large-v3")
+    parser.add_argument("--vol_aug", action="store_true")
+    args = parser.parse_args()
+    config_path = Path(args.config)
+    config = json.loads(config_path.read_text())
+    model = config["model"]
+    if model["speech_encoder"] != args.speech_encoder or model["ssl_dim"] != 1280 or model["vocoder_name"] != "nsf-hifigan":
+        parser.error("Configuration must match the Whisper large-v3 model in logs/44k")
+    source_dir = Path(args.source_dir)
+    if not source_dir.is_dir():
+        parser.error(f"Missing dataset directory: {source_dir}")
+    rng = random.Random(config["train"]["seed"])
+    train, val, speakers = [], [], {}
+    for speaker in sorted(path for path in source_dir.iterdir() if path.is_dir()):
+        wavs = [str(path) for path in sorted(speaker.glob("*.wav")) if get_wav_duration(path) >= 0.3]
+        if len(wavs) < 2:
+            parser.error(f"Speaker {speaker.name} needs at least two WAV files of 0.3 seconds or longer")
+        speakers[speaker.name] = len(speakers)
+        rng.shuffle(wavs)
+        val_count = min(2, len(wavs) - 1)
+        val.extend(wavs[:val_count])
+        train.extend(wavs[val_count:])
+    if not train or not val:
+        parser.error("Training and validation filelists must both contain audio")
+    rng.shuffle(train)
+    rng.shuffle(val)
+    train_path = Path(args.train_list or config["data"]["training_files"])
+    val_path = Path(args.val_list or config["data"]["validation_files"])
+    if train_path.resolve() == val_path.resolve():
+        parser.error("Training and validation filelists must have different paths")
+    for path, values in [(train_path, train), (val_path, val)]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(values) + "\n")
+    config["data"]["training_files"] = str(train_path)
+    config["data"]["validation_files"] = str(val_path)
+    config["spk"] = speakers
+    model["n_speakers"] = len(speakers)
+    if args.vol_aug:
+        config["train"]["vol_aug"] = True
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+    print(f"Training: {len(train)}, validation: {len(val)}, speakers: {speakers}")
+    print(f"Configuration updated: {config_path}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train_list", type=str, default="./filelists/train.txt", help="path to train list")
-    parser.add_argument("--val_list", type=str, default="./filelists/val.txt", help="path to val list")
-    parser.add_argument("--source_dir", type=str, default="./dataset/44k", help="path to source dir")
-    parser.add_argument("--speech_encoder", type=str, default="vec768l12", help="choice a speech encoder|'vec768l12','vec256l9','hubertsoft','whisper-ppg','whisper-ppg-large','cnhubertlarge','dphubert','whisper-ppg-large-v3','wavlmbase+'")
-    parser.add_argument("--vol_aug", action="store_true", help="Whether to use volume embedding and volume augmentation")
-    parser.add_argument("--tiny", action="store_true", help="Whether to train sovits tiny")
-    parser.add_argument("--tf_flow", action="store_true", help="Whether to Use transformer_flow")
-    args = parser.parse_args()
-    
-    config_template =  json.load(open("configs_template/config_tiny_template.json")) if args.tiny else json.load(open("configs_template/config_template.json"))
-    train = []
-    val = []
-    idx = 0
-    spk_dict = {}
-    spk_id = 0
-
-    for speaker in tqdm(os.listdir(args.source_dir)):
-        spk_dict[speaker] = spk_id
-        spk_id += 1
-        wavs = []
-
-        for file_name in os.listdir(os.path.join(args.source_dir, speaker)):
-            if not file_name.endswith("wav"):
-                continue
-            if file_name.startswith("."):
-                continue
-
-            file_path = "/".join([args.source_dir, speaker, file_name])
-
-            if not pattern.match(file_name):
-                logger.warning("Detected non-ASCII file name: " + file_path)
-
-            if get_wav_duration(file_path) < 0.3:
-                logger.info("Skip too short audio: " + file_path)
-                continue
-
-            wavs.append(file_path)
-
-        shuffle(wavs)
-        train += wavs[2:]
-        val += wavs[:2]
-
-    shuffle(train)
-    shuffle(val)
-
-    logger.info("Writing " + args.train_list)
-    with open(args.train_list, "w") as f:
-        for fname in tqdm(train):
-            wavpath = fname
-            f.write(wavpath + "\n")
-
-    logger.info("Writing " + args.val_list)
-    with open(args.val_list, "w") as f:
-        for fname in tqdm(val):
-            wavpath = fname
-            f.write(wavpath + "\n")
-
-
-    d_config_template = du.load_config("configs_template/diffusion_template.yaml")
-    d_config_template["model"]["n_spk"] = spk_id
-    d_config_template["data"]["encoder"] = args.speech_encoder
-    d_config_template["spk"] = spk_dict
-    
-    config_template["spk"] = spk_dict
-    config_template["model"]["n_speakers"] = spk_id
-    config_template["model"]["speech_encoder"] = args.speech_encoder
-    
-    if args.speech_encoder == "vec768l12" or args.speech_encoder == "dphubert" or args.speech_encoder == "wavlmbase+":
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 768
-        d_config_template["data"]["encoder_out_channels"] = 768
-    elif args.speech_encoder == "vec256l9" or args.speech_encoder == 'hubertsoft':
-        config_template["model"]["ssl_dim"] = config_template["model"]["gin_channels"] = 256
-        d_config_template["data"]["encoder_out_channels"] = 256
-    elif args.speech_encoder == "whisper-ppg" or args.speech_encoder == 'cnhubertlarge':
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1024
-        d_config_template["data"]["encoder_out_channels"] = 1024
-    elif args.speech_encoder == "whisper-ppg-large" or args.speech_encoder == "whisper-ppg-large-v3":
-        config_template["model"]["ssl_dim"] = config_template["model"]["filter_channels"] = config_template["model"]["gin_channels"] = 1280
-        d_config_template["data"]["encoder_out_channels"] = 1280
-        
-    if args.vol_aug:
-        config_template["train"]["vol_aug"] = config_template["model"]["vol_embedding"] = True
-
-    if args.tiny:
-        config_template["model"]["filter_channels"] = 512
-    
-    if args.tf_flow:
-        config_template["model"]["flow_share_parameter"] = config_template["model"]["use_transformer_flow"] = True
-    
-    logger.info("Writing to configs/config.json")
-    with open("configs/config.json", "w") as f:
-        json.dump(config_template, f, indent=2)
-    logger.info("Writing to configs/diffusion.yaml")
-    du.save_config("configs/diffusion.yaml",d_config_template)
+    main()

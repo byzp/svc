@@ -107,9 +107,9 @@ class STFT():
         y = y.squeeze(1)
         
         spec = torch.stft(y, n_fft_new, hop_length=hop_length_new, win_length=win_size_new, window=self.hann_window[keyshift_key],
-                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=True)
         # print(111,spec)
-        spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
+        spec = torch.sqrt(spec.abs().square() + 1e-9)
         if keyshift != 0:
             size = n_fft // 2 + 1
             resize = spec.size(1)

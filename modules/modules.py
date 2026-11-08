@@ -2,22 +2,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-import modules.attentions as attentions
 import modules.commons as commons
-from modules.commons import get_padding, init_weights
-from modules.DSConv import (
-    Depthwise_Separable_Conv1D,
-    remove_weight_norm_modules,
-    weight_norm_modules,
-)
+from torch.nn.utils import remove_weight_norm as remove_weight_norm_modules
+from torch.nn.utils import weight_norm as weight_norm_modules
 
 LRELU_SLOPE = 0.1
 
 Conv1dModel = nn.Conv1d
 
-def set_Conv1dModel(use_depthwise_conv):
-    global Conv1dModel
-    Conv1dModel = Depthwise_Separable_Conv1D if use_depthwise_conv else nn.Conv1d
 
 
 class LayerNorm(nn.Module):
@@ -34,40 +26,7 @@ class LayerNorm(nn.Module):
     x = F.layer_norm(x, (self.channels,), self.gamma, self.beta, self.eps)
     return x.transpose(1, -1)
 
- 
-class ConvReluNorm(nn.Module):
-  def __init__(self, in_channels, hidden_channels, out_channels, kernel_size, n_layers, p_dropout):
-    super().__init__()
-    self.in_channels = in_channels
-    self.hidden_channels = hidden_channels
-    self.out_channels = out_channels
-    self.kernel_size = kernel_size
-    self.n_layers = n_layers
-    self.p_dropout = p_dropout
-    assert n_layers > 1, "Number of layers should be larger than 0."
 
-    self.conv_layers = nn.ModuleList()
-    self.norm_layers = nn.ModuleList()
-    self.conv_layers.append(Conv1dModel(in_channels, hidden_channels, kernel_size, padding=kernel_size//2))
-    self.norm_layers.append(LayerNorm(hidden_channels))
-    self.relu_drop = nn.Sequential(
-        nn.ReLU(),
-        nn.Dropout(p_dropout))
-    for _ in range(n_layers-1):
-      self.conv_layers.append(Conv1dModel(hidden_channels, hidden_channels, kernel_size, padding=kernel_size//2))
-      self.norm_layers.append(LayerNorm(hidden_channels))
-    self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
-    self.proj.weight.data.zero_()
-    self.proj.bias.data.zero_()
-
-  def forward(self, x, x_mask):
-    x_org = x
-    for i in range(self.n_layers):
-      x = self.conv_layers[i](x * x_mask)
-      x = self.norm_layers[i](x)
-      x = self.relu_drop(x)
-    x = x_org + self.proj(x)
-    return x * x_mask
 
 
 class WN(torch.nn.Module):
@@ -146,88 +105,11 @@ class WN(torch.nn.Module):
       remove_weight_norm_modules(l)
 
 
-class ResBlock1(torch.nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock1, self).__init__()
-        self.convs1 = nn.ModuleList([
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=dilation[0],
-                               padding=get_padding(kernel_size, dilation[0]))),
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=dilation[1],
-                               padding=get_padding(kernel_size, dilation[1]))),
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=dilation[2],
-                               padding=get_padding(kernel_size, dilation[2])))
-        ])
-        self.convs1.apply(init_weights)
-
-        self.convs2 = nn.ModuleList([
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1))),
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1))),
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1)))
-        ])
-        self.convs2.apply(init_weights)
-
-    def forward(self, x, x_mask=None):
-        for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, LRELU_SLOPE)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c2(xt)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
-
-    def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm_modules(l)
-        for l in self.convs2:
-            remove_weight_norm_modules(l)
 
 
-class ResBlock2(torch.nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=(1, 3)):
-        super(ResBlock2, self).__init__()
-        self.convs = nn.ModuleList([
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=dilation[0],
-                               padding=get_padding(kernel_size, dilation[0]))),
-            weight_norm_modules(Conv1dModel(channels, channels, kernel_size, 1, dilation=dilation[1],
-                               padding=get_padding(kernel_size, dilation[1])))
-        ])
-        self.convs.apply(init_weights)
-
-    def forward(self, x, x_mask=None):
-        for c in self.convs:
-            xt = F.leaky_relu(x, LRELU_SLOPE)
-            if x_mask is not None:
-                xt = xt * x_mask
-            xt = c(xt)
-            x = xt + x
-        if x_mask is not None:
-            x = x * x_mask
-        return x
-
-    def remove_weight_norm(self):
-        for l in self.convs:
-            remove_weight_norm_modules(l)
 
 
-class Log(nn.Module):
-  def forward(self, x, x_mask, reverse=False, **kwargs):
-    if not reverse:
-      y = torch.log(torch.clamp_min(x, 1e-5)) * x_mask
-      logdet = torch.sum(-y, [1, 2])
-      return y, logdet
-    else:
-      x = torch.exp(x) * x_mask
-      return x
-    
+
 
 class Flip(nn.Module):
   def forward(self, x, *args, reverse=False, **kwargs):
@@ -239,22 +121,6 @@ class Flip(nn.Module):
       return x
 
 
-class ElementwiseAffine(nn.Module):
-  def __init__(self, channels):
-    super().__init__()
-    self.channels = channels
-    self.m = nn.Parameter(torch.zeros(channels,1))
-    self.logs = nn.Parameter(torch.zeros(channels,1))
-
-  def forward(self, x, x_mask, reverse=False, **kwargs):
-    if not reverse:
-      y = self.m + torch.exp(self.logs) * x
-      y = y * x_mask
-      logdet = torch.sum(self.logs * x_mask, [1,2])
-      return y, logdet
-    else:
-      x = (x - self.m) * torch.exp(-self.logs) * x_mask
-      return x
 
 
 class ResidualCouplingLayer(nn.Module):
@@ -281,55 +147,6 @@ class ResidualCouplingLayer(nn.Module):
 
     self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
     self.enc = WN(hidden_channels, kernel_size, dilation_rate, n_layers, p_dropout=p_dropout, gin_channels=gin_channels) if wn_sharing_parameter is None else wn_sharing_parameter
-    self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
-    self.post.weight.data.zero_()
-    self.post.bias.data.zero_()
-
-  def forward(self, x, x_mask, g=None, reverse=False):
-    x0, x1 = torch.split(x, [self.half_channels]*2, 1)
-    h = self.pre(x0) * x_mask
-    h = self.enc(h, x_mask, g=g)
-    stats = self.post(h) * x_mask
-    if not self.mean_only:
-      m, logs = torch.split(stats, [self.half_channels]*2, 1)
-    else:
-      m = stats
-      logs = torch.zeros_like(m)
-
-    if not reverse:
-      x1 = m + x1 * torch.exp(logs) * x_mask
-      x = torch.cat([x0, x1], 1)
-      logdet = torch.sum(logs, [1,2])
-      return x, logdet
-    else:
-      x1 = (x1 - m) * torch.exp(-logs) * x_mask
-      x = torch.cat([x0, x1], 1)
-      return x
-
-class TransformerCouplingLayer(nn.Module):
-  def __init__(self,
-      channels,
-      hidden_channels,
-      kernel_size,
-      n_layers,
-      n_heads,
-      p_dropout=0,
-      filter_channels=0,
-      mean_only=False,
-      wn_sharing_parameter=None,
-      gin_channels = 0
-      ):
-    assert channels % 2 == 0, "channels should be divisible by 2"
-    super().__init__()
-    self.channels = channels
-    self.hidden_channels = hidden_channels
-    self.kernel_size = kernel_size
-    self.n_layers = n_layers
-    self.half_channels = channels // 2
-    self.mean_only = mean_only
-
-    self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
-    self.enc = attentions.FFT(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, isflow = True, gin_channels = gin_channels) if wn_sharing_parameter is None else wn_sharing_parameter
     self.post = nn.Conv1d(hidden_channels, self.half_channels * (2 - mean_only), 1)
     self.post.weight.data.zero_()
     self.post.bias.data.zero_()

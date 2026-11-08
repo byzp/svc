@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
-from torchaudio.transforms import Resample
+from modules.F0Predictor.audio import resample_audio
 
 from .nvSTFT import STFT
 from .pcmer import PCmer
@@ -131,7 +131,7 @@ class FCPE(nn.Module):
             return rtn, confident
         else:
             return rtn
-        
+
     def cents_local_decoder(self, y, mask=True):
         B, N, _ = y.size()
         ci = self.cent_table[None, None, :].expand(B, N, -1)
@@ -169,7 +169,7 @@ class FCPEInfer:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.device = device
-        ckpt = torch.load(model_path, map_location=torch.device(self.device))
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
         self.args = DotDict(ckpt["config"])
         self.dtype = dtype
         model = FCPE(
@@ -222,27 +222,19 @@ class Wav2Mel:
             args.mel.fmin,
             args.mel.fmax
         )
-        self.resample_kernel = {}
 
     def extract_nvstft(self, audio, keyshift=0, train=False):
         mel = self.stft.get_mel(audio, keyshift=keyshift, train=train).transpose(1, 2)  # B, n_frames, bins
         return mel
 
     def extract_mel(self, audio, sample_rate, keyshift=0, train=False):
-        audio = audio.to(self.dtype).to(self.device)
-        # resample
-        if sample_rate == self.sampling_rate:
-            audio_res = audio
-        else:
-            key_str = str(sample_rate)
-            if key_str not in self.resample_kernel:
-                self.resample_kernel[key_str] = Resample(sample_rate, self.sampling_rate, lowpass_filter_width=128)
-            self.resample_kernel[key_str] = self.resample_kernel[key_str].to(self.dtype).to(self.device)
-            audio_res = self.resample_kernel[key_str](audio)
+        # Spectral features stay in FP32 independently of network precision.
+        audio = audio.float().to(self.device)
+        audio_res = resample_audio(audio, sample_rate, self.sampling_rate)
 
         # extract
         mel = self.extract_nvstft(audio_res, keyshift=keyshift, train=train)  # B, n_frames, bins
-        n_frames = int(audio.shape[1] // self.hop_size) + 1
+        n_frames = int(audio_res.shape[1] // self.hop_size) + 1
         if n_frames > int(mel.shape[1]):
             mel = torch.cat((mel, mel[:, -1:, :]), 1)
         if n_frames < int(mel.shape[1]):

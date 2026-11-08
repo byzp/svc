@@ -6,16 +6,11 @@ import os
 import re
 import subprocess
 import sys
-import traceback
-from multiprocessing import cpu_count
 import threading
 
-import faiss
-import librosa
 import numpy as np
 import torch
 from scipy.io.wavfile import read
-from sklearn.cluster import MiniBatchKMeans
 from torch.nn import functional as F
 
 MATPLOTLIB_FLAG = False
@@ -82,85 +77,12 @@ def f0_to_coarse(f0):
   f0_coarse = f0_coarse + ((f0_coarse >= f0_bin) * (f0_bin - 1))
   return f0_coarse
 
-def get_content(cmodel, y):
-    with torch.no_grad():
-        c = cmodel.extract_features(y.squeeze(1))[0]
-    c = c.transpose(1, 2)
-    return c
 
-def get_f0_predictor(f0_predictor,hop_length,sampling_rate,**kargs):
-    if f0_predictor == "pm":
-        from modules.F0Predictor.PMF0Predictor import PMF0Predictor
-        f0_predictor_object = PMF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
-    elif f0_predictor == "crepe":
-        from modules.F0Predictor.CrepeF0Predictor import CrepeF0Predictor
-        f0_predictor_object = CrepeF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,device=kargs["device"],threshold=kargs["threshold"])
-    elif f0_predictor == "harvest":
-        from modules.F0Predictor.HarvestF0Predictor import HarvestF0Predictor
-        f0_predictor_object = HarvestF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate)
-    elif f0_predictor == "dio":
-        from modules.F0Predictor.DioF0Predictor import DioF0Predictor
-        f0_predictor_object = DioF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate) 
-    elif f0_predictor == "rmvpe":
-        from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor
-        f0_predictor_object = RMVPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float16 ,device=kargs["device"],threshold=kargs["threshold"])
-    elif f0_predictor == "fcpe":
-        from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor
-        f0_predictor_object = FCPEF0Predictor(hop_length=hop_length,sampling_rate=sampling_rate,dtype=torch.float32 ,device=kargs["device"],threshold=kargs["threshold"])
-    else:
-        raise Exception("Unknown f0 predictor")
-    return f0_predictor_object
 
-def get_speech_encoder(speech_encoder,device=None,**kargs):
-    if speech_encoder == "vec768l12":
-        from vencoder.ContentVec768L12 import ContentVec768L12
-        speech_encoder_object = ContentVec768L12(device = device)
-    elif speech_encoder == "vec256l9":
-        from vencoder.ContentVec256L9 import ContentVec256L9
-        speech_encoder_object = ContentVec256L9(device = device)
-    elif speech_encoder == "vec256l9-onnx":
-        from vencoder.ContentVec256L9_Onnx import ContentVec256L9_Onnx
-        speech_encoder_object = ContentVec256L9_Onnx(device = device)
-    elif speech_encoder == "vec256l12-onnx":
-        from vencoder.ContentVec256L12_Onnx import ContentVec256L12_Onnx
-        speech_encoder_object = ContentVec256L12_Onnx(device = device)
-    elif speech_encoder == "vec768l9-onnx":
-        from vencoder.ContentVec768L9_Onnx import ContentVec768L9_Onnx
-        speech_encoder_object = ContentVec768L9_Onnx(device = device)
-    elif speech_encoder == "vec768l12-onnx":
-        from vencoder.ContentVec768L12_Onnx import ContentVec768L12_Onnx
-        speech_encoder_object = ContentVec768L12_Onnx(device = device)
-    elif speech_encoder == "hubertsoft-onnx":
-        from vencoder.HubertSoft_Onnx import HubertSoft_Onnx
-        speech_encoder_object = HubertSoft_Onnx(device = device)
-    elif speech_encoder == "hubertsoft":
-        from vencoder.HubertSoft import HubertSoft
-        speech_encoder_object = HubertSoft(device = device)
-    elif speech_encoder == "whisper-ppg":
-        from vencoder.WhisperPPG import WhisperPPG
-        speech_encoder_object = WhisperPPG(device = device)
-    elif speech_encoder == "cnhubertlarge":
-        from vencoder.CNHubertLarge import CNHubertLarge
-        speech_encoder_object = CNHubertLarge(device = device)
-    elif speech_encoder == "dphubert":
-        from vencoder.DPHubert import DPHubert
-        speech_encoder_object = DPHubert(device = device)
-    elif speech_encoder == "whisper-ppg-large":
-        from vencoder.WhisperPPGLarge import WhisperPPGLarge
-        speech_encoder_object = WhisperPPGLarge(device = device)
-    elif speech_encoder == "whisper-ppg-large-v3":
-        from vencoder.WhisperPPGLargeV3 import WhisperPPGLargeV3
-        speech_encoder_object = WhisperPPGLargeV3(device = device)
-    elif speech_encoder == "wavlmbase+":
-        from vencoder.WavLMBasePlus import WavLMBasePlus
-        speech_encoder_object = WavLMBasePlus(device = device)
-    else:
-        raise Exception("Unknown speech encoder")
-    return speech_encoder_object 
 
 def load_checkpoint(checkpoint_path, model, optimizer=None, skip_optimizer=False):
     assert os.path.isfile(checkpoint_path)
-    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     iteration = checkpoint_dict['iteration']
     learning_rate = checkpoint_dict['learning_rate']
     if optimizer is not None and not skip_optimizer and checkpoint_dict['optimizer'] is not None:
@@ -225,7 +147,7 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path,
         logger.info(f"Async save started for {checkpoint_path}")
     else:
         _do_save()
-        
+
 def clean_checkpoints(path_to_models='logs/44k/', n_ckpts_to_keep=2, sort_by_time=True):
   """Freeing up space by deleting saved ckpts
 
@@ -265,6 +187,8 @@ def summarize(writer, global_step, scalars={}, histograms={}, images={}, audios=
 def latest_checkpoint_path(dir_path, regex="G_*.pth"):
   f_list = glob.glob(os.path.join(dir_path, regex))
   f_list.sort(key=lambda f: int("".join(filter(str.isdigit, f))))
+  if not f_list:
+    return None
   x = f_list[-1]
   print(x)
   return x
@@ -298,35 +222,6 @@ def plot_spectrogram_to_numpy(spectrogram):
   return data
 
 
-def plot_alignment_to_numpy(alignment, info=None):
-  global MATPLOTLIB_FLAG
-  if not MATPLOTLIB_FLAG:
-    import matplotlib
-    matplotlib.use("Agg")
-    MATPLOTLIB_FLAG = True
-    mpl_logger = logging.getLogger('matplotlib')
-    mpl_logger.setLevel(logging.WARNING)
-  import matplotlib.pylab as plt
-  import numpy as np
-
-  fig, ax = plt.subplots(figsize=(6, 4))
-  im = ax.imshow(alignment.transpose(), aspect='auto', origin='lower',
-                  interpolation='none')
-  fig.colorbar(im, ax=ax)
-  xlabel = 'Decoder timestep'
-  if info is not None:
-      xlabel += '\n\n' + info
-  plt.xlabel(xlabel)
-  plt.ylabel('Encoder timestep')
-  plt.tight_layout()
-
-  fig.canvas.draw()
-  w, h = fig.canvas.get_width_height()
-  data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
-  data = data[:, :, :3]
-
-  plt.close()
-  return data
 
 
 def load_wav_to_torch(full_path):
@@ -370,15 +265,6 @@ def get_hparams(init=True):
   return hparams
 
 
-def get_hparams_from_dir(model_dir):
-  config_save_path = os.path.join(model_dir, "config.json")
-  with open(config_save_path, "r") as f:
-    data = f.read()
-  config = json.loads(data)
-
-  hparams =HParams(**config)
-  hparams.model_dir = model_dir
-  return hparams
 
 
 def get_hparams_from_file(config_path, infer_mode = False):
@@ -455,21 +341,10 @@ def repeat_expand_2d_other(content, target_len, mode = 'nearest'):
     return target
 
 
-def mix_model(model_paths,mix_rate,mode):
-  mix_rate = torch.FloatTensor(mix_rate)/100
-  model_tem = torch.load(model_paths[0])
-  models = [torch.load(path)["model"] for path in model_paths]
-  if mode == 0:
-     mix_rate = F.softmax(mix_rate,dim=0)
-  for k in model_tem["model"].keys():
-     model_tem["model"][k] = torch.zeros_like(model_tem["model"][k])
-     for i,model in enumerate(models):
-        model_tem["model"][k] += model[k]*mix_rate[i]
-  torch.save(model_tem,os.path.join(os.path.curdir,"output.pth"))
-  return os.path.join(os.path.curdir,"output.pth")
-  
+
 def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出音频,rate是2的占比 from RVC
     # print(data1.max(),data2.max())
+    import librosa
     rms1 = librosa.feature.rms(
         y=data1, frame_length=sr1 // 2 * 2, hop_length=sr1 // 2
     )  # 每半秒一个点
@@ -489,57 +364,6 @@ def change_rms(data1, sr1, data2, sr2, rate):  # 1是输入音频，2是输出�
     )
     return data2
 
-def train_index(spk_name,root_dir = "dataset/44k/"):  #from: RVC https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI
-    n_cpu = cpu_count()
-    print("The feature index is constructing.")
-    exp_dir = os.path.join(root_dir,spk_name)
-    listdir_res = []
-    for file in os.listdir(exp_dir):
-       if ".wav.soft.pt" in file:
-          listdir_res.append(os.path.join(exp_dir,file))
-    if len(listdir_res) == 0:
-        raise Exception("You need to run preprocess_hubert_f0.py!")
-    npys = []
-    for name in sorted(listdir_res):
-        phone = torch.load(name)[0].transpose(-1,-2).numpy()
-        npys.append(phone)
-    big_npy = np.concatenate(npys, 0)
-    big_npy_idx = np.arange(big_npy.shape[0])
-    np.random.shuffle(big_npy_idx)
-    big_npy = big_npy[big_npy_idx]
-    if big_npy.shape[0] > 2e5:
-        # if(1):
-        info = "Trying doing kmeans %s shape to 10k centers." % big_npy.shape[0]
-        print(info)
-        try:
-            big_npy = (
-                MiniBatchKMeans(
-                    n_clusters=10000,
-                    verbose=True,
-                    batch_size=256 * n_cpu,
-                    compute_labels=False,
-                    init="random",
-                )
-                .fit(big_npy)
-                .cluster_centers_
-            )
-        except Exception:
-            info = traceback.format_exc()
-            print(info)
-    n_ivf = min(int(16 * np.sqrt(big_npy.shape[0])), big_npy.shape[0] // 39)
-    index = faiss.index_factory(big_npy.shape[1] , "IVF%s,Flat" % n_ivf)
-    index_ivf = faiss.extract_index_ivf(index)  #
-    index_ivf.nprobe = 1
-    index.train(big_npy)
-    batch_size_add = 8192
-    for i in range(0, big_npy.shape[0], batch_size_add):
-        index.add(big_npy[i : i + batch_size_add])
-    # faiss.write_index(
-    #     index,
-    #     f"added_{spk_name}.index"
-    # )
-    print("Successfully build index")
-    return index
 
 
 class HParams():
@@ -576,7 +400,7 @@ class HParams():
   def get(self,index):
     return self.__dict__.get(index)
 
-  
+
 class InferHParams(HParams):
   def __init__(self, **kwargs):
     for k, v in kwargs.items():
@@ -591,7 +415,7 @@ class InferHParams(HParams):
 class Volume_Extractor:
     def __init__(self, hop_size = 512):
         self.hop_size = hop_size
-        
+
     def extract(self, audio): # audio: 2d tensor array
         if not isinstance(audio,torch.Tensor):
            audio = torch.Tensor(audio)
@@ -600,3 +424,40 @@ class Volume_Extractor:
         volume = torch.nn.functional.unfold(audio2[:,None,None,:],(1,self.hop_size),stride=self.hop_size)[:,:,:n_frames].mean(dim=1)[0]
         volume = torch.sqrt(volume)
         return volume
+
+
+def get_f0_predictor(f0_predictor, hop_length, sampling_rate, **kwargs):
+    if f0_predictor == "pm":
+        from modules.F0Predictor.PMF0Predictor import PMF0Predictor as Predictor
+    elif f0_predictor == "dio":
+        from modules.F0Predictor.DioF0Predictor import DioF0Predictor as Predictor
+    elif f0_predictor == "harvest":
+        from modules.F0Predictor.HarvestF0Predictor import HarvestF0Predictor as Predictor
+    elif f0_predictor == "crepe":
+        from modules.F0Predictor.CrepeF0Predictor import CrepeF0Predictor as Predictor
+    elif f0_predictor == "rmvpe":
+        from modules.F0Predictor.RMVPEF0Predictor import RMVPEF0Predictor as Predictor
+    elif f0_predictor == "fcpe":
+        from modules.F0Predictor.FCPEF0Predictor import FCPEF0Predictor as Predictor
+    else:
+        from modules.F0Predictor import F0_PREDICTORS
+        raise ValueError(f"Supported F0 predictors: {', '.join(F0_PREDICTORS)}")
+    if f0_predictor in {"crepe", "rmvpe", "fcpe"}:
+        options = {}
+        if f0_predictor == "rmvpe":
+            device = torch.device(kwargs.get("device") or ("cuda" if torch.cuda.is_available() else "cpu"))
+            options["dtype"] = torch.float16 if device.type == "cuda" else torch.float32
+        return Predictor(
+            hop_length=hop_length, sampling_rate=sampling_rate,
+            device=kwargs.get("device"), threshold=kwargs.get("threshold", 0.05),
+            **options,
+        )
+    return Predictor(hop_length=hop_length, sampling_rate=sampling_rate)
+
+
+def get_speech_encoder(speech_encoder, device=None, **kwargs):
+    if speech_encoder != "whisper-ppg-large-v3":
+        raise ValueError("Only whisper-ppg-large-v3 is supported")
+    from vencoder.WhisperPPGLargeV3 import WhisperPPGLargeV3
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    return WhisperPPGLargeV3(device=device, **kwargs)

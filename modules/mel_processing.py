@@ -14,13 +14,6 @@ def dynamic_range_compression_torch(x, C=1, clip_val=1e-5):
     return torch.log(torch.clamp(x, min=clip_val) * C)
 
 
-def dynamic_range_decompression_torch(x, C=1):
-    """
-    PARAMS
-    ------
-    C: compression factor used to compress
-    """
-    return torch.exp(x) / C
 
 
 def spectral_normalize_torch(magnitudes):
@@ -28,9 +21,6 @@ def spectral_normalize_torch(magnitudes):
     return output
 
 
-def spectral_de_normalize_torch(magnitudes):
-    output = dynamic_range_decompression_torch(magnitudes)
-    return output
 
 
 mel_basis = {}
@@ -51,7 +41,7 @@ def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False)
 
     y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
     y = y.squeeze(1)
-    
+
     y_dtype = y.dtype
     if y.dtype == torch.bfloat16:
         y = y.to(torch.float32)
@@ -79,5 +69,5 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
 def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
     spec = spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center)
     spec = spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax)
-    
+
     return spec
