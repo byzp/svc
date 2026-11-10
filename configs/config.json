@@ -10,7 +10,8 @@
       0.99
     ],
     "eps": 1e-09,
-    "batch_size": 5,
+    "batch_size": 8,
+    "grad_accumulate": 1,
     "fp16_run": true,
     "half_type": "fp16",
     "lr_decay": 0.999875,
@@ -24,6 +25,9 @@
     "port": "8001",
     "keep_ckpts": 3,
     "all_in_mem": false,
+    "recompute_mel": true,
+    "use_cached_spectrogram": true,
+    "prefetch_factor": 16,
     "vol_aug": true
   },
   "data": {

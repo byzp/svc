@@ -27,11 +27,12 @@ mel_basis = {}
 hann_window = {}
 
 
-def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False):
-    if torch.min(y) < -1.:
-        print('min value is ', torch.min(y))
-    if torch.max(y) > 1.:
-        print('max value is ', torch.max(y))
+def spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center=False, check_range=True):
+    if check_range:
+        if torch.min(y) < -1.:
+            print('min value is ', torch.min(y))
+        if torch.max(y) > 1.:
+            print('max value is ', torch.max(y))
 
     global hann_window
     dtype_device = str(y.dtype) + '_' + str(y.device)
@@ -66,8 +67,8 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax):
     return spec
 
 
-def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
-    spec = spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center)
+def mel_spectrogram_torch(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False, check_range=True):
+    spec = spectrogram_torch(y, n_fft, sampling_rate, hop_size, win_size, center, check_range=check_range)
     spec = spec_to_mel_torch(spec, n_fft, num_mels, sampling_rate, fmin, fmax)
 
     return spec

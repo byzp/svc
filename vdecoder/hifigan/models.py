@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Conv1d, ConvTranspose1d
-from torch.nn.utils import remove_weight_norm, weight_norm
+from modules.weight_norm import remove_weight_norm, weight_norm
+from modules.cuda_graph import CudaGraphModule
 from .utils import get_padding, init_weights
 LRELU_SLOPE = 0.1
 
@@ -21,7 +22,7 @@ class ResBlock1(torch.nn.Module):
         for c1, c2 in zip(self.convs1, self.convs2):
             xt = F.leaky_relu(x, LRELU_SLOPE)
             xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
+            xt = F.leaky_relu(xt, LRELU_SLOPE, inplace=True)
             xt = c2(xt)
             x = xt + x
         return x
@@ -31,9 +32,6 @@ class ResBlock1(torch.nn.Module):
             remove_weight_norm(l)
         for l in self.convs2:
             remove_weight_norm(l)
-
-def padDiff(x):
-    return F.pad(F.pad(x, (0, 0, -1, 1), 'constant', 0) - x, (0, 0, 0, -1), 'constant', 0)
 
 class SineGen(torch.nn.Module):
     """ Definition of sine generator
@@ -60,6 +58,7 @@ class SineGen(torch.nn.Module):
         self.sampling_rate = samp_rate
         self.voiced_threshold = voiced_threshold
         self.flag_for_pulse = flag_for_pulse
+        self.register_buffer("harmonics", torch.arange(1, self.dim + 1, dtype=torch.float32)[None, None], persistent=False)
 
     def _f02uv(self, f0):
         uv = (f0 > self.voiced_threshold).type(torch.float32)
@@ -74,11 +73,13 @@ class SineGen(torch.nn.Module):
         rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
         if not self.flag_for_pulse:
-            tmp_over_one = torch.cumsum(rad_values, 1) % 1
-            tmp_over_one_idx = padDiff(tmp_over_one) < 0
+            # Scan contiguous time rows instead of serial strided columns.
+            tmp_over_one = torch.cumsum(rad_values.transpose(1, 2).contiguous(), -1).transpose(1, 2) % 1
+            tmp_over_one_idx = torch.diff(tmp_over_one, dim=1) < 0
             cumsum_shift = torch.zeros_like(rad_values)
             cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-            sines = torch.sin(torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi)
+            phase = torch.cumsum((rad_values + cumsum_shift).transpose(1, 2).contiguous(), -1).transpose(1, 2)
+            sines = torch.sin(phase * 2 * np.pi)
         else:
             uv = self._f02uv(f0_values)
             uv_1 = torch.roll(uv, shifts=-1, dims=1)
@@ -102,7 +103,7 @@ class SineGen(torch.nn.Module):
         output uv: tensor(batchsize=1, length, 1)
         """
         with torch.no_grad():
-            fn = torch.multiply(f0, torch.FloatTensor([[range(1, self.harmonic_num + 2)]]).to(f0.device))
+            fn = f0 * self.harmonics.float()
             sine_waves = self._f02sine(fn) * self.sine_amp
         return (sine_waves, 0, 0)
 
@@ -143,7 +144,7 @@ class SourceModuleHnNSF(torch.nn.Module):
         sine_merge = self.l_tanh(self.l_linear(sine_wavs.to(self.l_linear.weight.dtype)))
         return (sine_merge, 0, 0)
 
-class Generator(torch.nn.Module):
+class Generator(CudaGraphModule):
 
     def __init__(self, h):
         super(Generator, self).__init__()
@@ -176,6 +177,12 @@ class Generator(torch.nn.Module):
         self.upp = np.prod(h['upsample_rates'])
 
     def forward(self, x, f0, g=None):
+        if self.training and torch.is_grad_enabled() and x.is_cuda:
+            args = (x, f0) if g is None else (x, f0, g)
+            return self._call_graphed(self._forward, args)
+        return self._forward(x, f0, g)
+
+    def _forward(self, x, f0, g=None):
         f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)
         har_source, noi_source, uv = self.m_source(f0, self.upp)
         har_source = har_source.transpose(1, 2)

@@ -34,8 +34,18 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.sampling_rate = hparams.data.sampling_rate
         self.use_sr = hparams.train.use_sr
         self.spec_len = hparams.train.max_speclen
+        self.recompute_mel = getattr(hparams.train, "recompute_mel", False)
+        if not isinstance(self.recompute_mel, bool):
+            raise ValueError("train.recompute_mel must be a boolean")
+        self.use_cached_spectrogram = (
+            not self.recompute_mel and getattr(hparams.train, "use_cached_spectrogram", True)
+        )
+        min_frames = hparams.train.segment_size // self.hop_length
+        if not isinstance(self.spec_len, int) or self.spec_len < min_frames:
+            raise ValueError("train.max_speclen must cover at least train.segment_size / data.hop_length frames")
         self.spk_map = hparams.spk
         self.vol_emb = hparams.model.vol_embedding
+        self.volume_extractor = utils.Volume_Extractor(self.hop_length) if self.recompute_mel and self.vol_emb else None
         self.vol_aug = hparams.train.vol_aug and vol_aug
         random.seed(1234)
         random.shuffle(self.audiopaths)
@@ -55,15 +65,16 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         audio_norm = audio_norm.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
 
-        # Ideally, all data generated after Mar 25 should have .spec.pt
-        if os.path.exists(spec_filename):
-            spec = torch.load(spec_filename)
+        # Slow disks can avoid large cached spectra and compute from WAV instead.
+        if self.use_cached_spectrogram and os.path.exists(spec_filename):
+            spec = torch.load(spec_filename, map_location="cpu", weights_only=True)
         else:
             spec = spectrogram_torch(audio_norm, self.filter_length,
                                      self.sampling_rate, self.hop_length, self.win_length,
                                      center=False)
             spec = torch.squeeze(spec, 0)
-            torch.save(spec, spec_filename)
+            if self.use_cached_spectrogram:
+                torch.save(spec, spec_filename)
 
         spk = filename.split("/")[-2]
         spk = torch.LongTensor([self.spk_map[spk]])
@@ -73,12 +84,15 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         f0 = torch.FloatTensor(np.array(f0,dtype=float))
         uv = torch.FloatTensor(np.array(uv,dtype=float))
 
-        c = torch.load(filename+ ".soft.pt")
+        c = torch.load(filename + ".soft.pt", map_location="cpu", weights_only=True)
         c = utils.repeat_expand_2d(c.squeeze(0), f0.shape[0], mode=self.unit_interpolate_mode)
         if self.vol_emb:
-            volume_path = filename + ".vol.npy"
-            volume = np.load(volume_path)
-            volume = torch.from_numpy(volume).float()
+            if self.recompute_mel:
+                volume = self.volume_extractor.extract(audio_norm)
+            else:
+                volume_path = filename + ".vol.npy"
+                volume = np.load(volume_path)
+                volume = torch.from_numpy(volume).float()
         else:
             volume = None
 
@@ -100,18 +114,16 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             max_amp = float(torch.max(torch.abs(audio_norm))) + 1e-5
             max_shift = min(1, np.log10(1/max_amp))
             log10_vol_shift = random.uniform(-1, max_shift)
-            audio_norm = audio_norm * (10 ** log10_vol_shift)
-            volume = volume * (10 ** log10_vol_shift)
-            spec = spectrogram_torch(audio_norm,
-            self.hparams.data.filter_length,
-            self.hparams.data.sampling_rate,
-            self.hparams.data.hop_length,
-            self.hparams.data.win_length,
-            center=False)[0]
+            gain = 10 ** log10_vol_shift
+            audio_norm = audio_norm * gain
+            volume = volume * gain
+            # STFT is linear. Rescale the cached magnitude instead of running
+            # another FFT, retaining spectrogram_torch's magnitude epsilon.
+            spec = ((spec.square() - 1e-6).clamp_min_(0) * gain ** 2 + 1e-6).sqrt()
 
-        if spec.shape[1] > 800:
-            start = random.randint(0, spec.shape[1]-800)
-            end = start + 790
+        if spec.shape[1] > self.spec_len:
+            start = random.randint(0, spec.shape[1] - self.spec_len)
+            end = start + self.spec_len
             spec, c, f0, uv = spec[:, start:end], c[:, start:end], f0[start:end], uv[start:end]
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
             if volume is not None:

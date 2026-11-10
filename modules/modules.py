@@ -3,8 +3,9 @@ from torch import nn
 from torch.nn import functional as F
 
 import modules.commons as commons
-from torch.nn.utils import remove_weight_norm as remove_weight_norm_modules
-from torch.nn.utils import weight_norm as weight_norm_modules
+from modules.cuda_graph import CudaGraphModule
+from modules.weight_norm import remove_weight_norm as remove_weight_norm_modules
+from modules.weight_norm import weight_norm as weight_norm_modules
 
 LRELU_SLOPE = 0.1
 
@@ -29,7 +30,7 @@ class LayerNorm(nn.Module):
 
 
 
-class WN(torch.nn.Module):
+class WN(CudaGraphModule):
   def __init__(self, hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=0, p_dropout=0):
     super(WN, self).__init__()
     assert(kernel_size % 2 == 1)
@@ -67,8 +68,13 @@ class WN(torch.nn.Module):
       self.res_skip_layers.append(res_skip_layer)
 
   def forward(self, x, x_mask, g=None, **kwargs):
+    if self.training and torch.is_grad_enabled() and x.is_cuda:
+      args = (x, x_mask) if g is None else (x, x_mask, g)
+      return self._call_graphed(self._forward, args)
+    return self._forward(x, x_mask, g, **kwargs)
+
+  def _forward(self, x, x_mask, g=None, **kwargs):
     output = torch.zeros_like(x)
-    n_channels_tensor = torch.IntTensor([self.hidden_channels])
 
     if g is not None:
       g = self.cond_layer(g)
@@ -84,7 +90,7 @@ class WN(torch.nn.Module):
       acts = commons.fused_add_tanh_sigmoid_multiply(
           x_in,
           g_l,
-          n_channels_tensor)
+          self.hidden_channels)
       acts = self.drop(acts)
 
       res_skip_acts = self.res_skip_layers[i](acts)

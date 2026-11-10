@@ -2,11 +2,13 @@ import torch
 from torch import nn
 from torch.nn import Conv1d, Conv2d
 from torch.nn import functional as F
-from torch.nn.utils import spectral_norm, weight_norm
+from torch.nn.utils import spectral_norm
+from modules.weight_norm import weight_norm
 
 import modules.attentions as attentions
 import modules.commons as commons
 import modules.modules as modules
+from modules.cuda_graph import CudaGraphModule
 import utils
 from modules.commons import get_padding
 from utils import f0_to_coarse
@@ -86,7 +88,7 @@ class Encoder(nn.Module):
         return z, m, logs, x_mask
 
 
-class TextEncoder(nn.Module):
+class TextEncoder(CudaGraphModule):
     def __init__(self,
                  out_channels,
                  hidden_channels,
@@ -114,6 +116,16 @@ class TextEncoder(nn.Module):
             p_dropout)
 
     def forward(self, x, x_mask, f0=None, noice_scale=1):
+        if self.training and torch.is_grad_enabled() and x.is_cuda and noice_scale == 1:
+            z, m, logs = self._call_graphed(self._graph_forward, (x, x_mask, f0))
+            # Keep this non-differentiable output outside the autograd graph.
+            return z, m, logs, x_mask
+        return self._forward(x, x_mask, f0, noice_scale)
+
+    def _graph_forward(self, x, x_mask, f0):
+        return self._forward(x, x_mask, f0)[:3]
+
+    def _forward(self, x, x_mask, f0=None, noice_scale=1):
         x = x + self.f0_emb(f0).transpose(1, 2)
         x = self.enc_(x * x_mask, x_mask)
         stats = self.proj(x) * x_mask
@@ -151,7 +163,7 @@ class DiscriminatorP(torch.nn.Module):
 
         for l in self.convs:
             x = l(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -179,7 +191,7 @@ class DiscriminatorS(torch.nn.Module):
 
         for l in self.convs:
             x = l(x)
-            x = F.leaky_relu(x, modules.LRELU_SLOPE)
+            x = F.leaky_relu(x, modules.LRELU_SLOPE, inplace=True)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -191,6 +203,7 @@ class DiscriminatorS(torch.nn.Module):
 class MultiPeriodDiscriminator(torch.nn.Module):
     def __init__(self, use_spectral_norm=False):
         super(MultiPeriodDiscriminator, self).__init__()
+        self.use_spectral_norm = use_spectral_norm
         periods = [2, 3, 5, 7, 11]
 
         discs = [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
@@ -202,19 +215,41 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         y_d_gs = []
         fmap_rs = []
         fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            y_d_gs.append(y_d_g)
-            fmap_rs.append(fmap_r)
-            fmap_gs.append(fmap_g)
+        # These discriminators have no batch-dependent layers. Combining real
+        # and fake examples saves convolution launches and weight reductions.
+        # Spectral norm mutates its buffers per call, so keep that path serial.
+        combined = (
+            torch.cat((y, y_hat), dim=0)
+            if y is not None and not self.use_spectral_norm and y.shape[1:] == y_hat.shape[1:]
+            else None
+        )
+        # Never retain normalized weights across the later frozen-D forward.
+        with torch.nn.utils.parametrize.cached():
+            for d in self.discriminators:
+                if combined is not None:
+                    scores, features = d(combined)
+                    batch_size = y.size(0)
+                    y_d_rs.append(scores[:batch_size])
+                    y_d_gs.append(scores[batch_size:])
+                    fmap_rs.append([feature[:batch_size] for feature in features])
+                    fmap_gs.append([feature[batch_size:] for feature in features])
+                    continue
+                if y is not None:
+                    y_d_r, fmap_r = d(y)
+                    y_d_rs.append(y_d_r)
+                    fmap_rs.append(fmap_r)
+                y_d_g, fmap_g = d(y_hat)
+                y_d_gs.append(y_d_g)
+                fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
 
-class F0Decoder(nn.Module):
+class F0Decoder(CudaGraphModule):
+    # Conditioning can be omitted; then cond's parameters are intentionally unused.
+    _allow_unused_graph_input = True
+
     def __init__(self,
                  out_channels,
                  hidden_channels,
@@ -247,6 +282,13 @@ class F0Decoder(nn.Module):
         self.cond = nn.Conv1d(spk_channels, hidden_channels, 1)
 
     def forward(self, x, norm_f0, x_mask, spk_emb=None):
+        x = x.detach()
+        if self.training and torch.is_grad_enabled() and x.is_cuda:
+            args = (x, norm_f0, x_mask) if spk_emb is None else (x, norm_f0, x_mask, spk_emb)
+            return self._call_graphed(self._forward, args)
+        return self._forward(x, norm_f0, x_mask, spk_emb)
+
+    def _forward(self, x, norm_f0, x_mask, spk_emb=None):
         x = torch.detach(x)
         if (spk_emb is not None):
             x = x + self.cond(spk_emb)

@@ -419,11 +419,9 @@ class Volume_Extractor:
     def extract(self, audio): # audio: 2d tensor array
         if not isinstance(audio,torch.Tensor):
            audio = torch.Tensor(audio)
-        n_frames = int(audio.size(-1) // self.hop_size)
-        audio2 = audio ** 2
-        volume = torch.nn.functional.unfold(audio2[:,None,None,:],(1,self.hop_size),stride=self.hop_size)[:,:,:n_frames].mean(dim=1)[0]
-        volume = torch.sqrt(volume)
-        return volume
+        # Nonoverlapping frame views avoid the im2col copy made by F.unfold.
+        frames = audio.square().unfold(-1, self.hop_size, self.hop_size)
+        return frames.mean(dim=-1).sqrt()[0]
 
 
 def get_f0_predictor(f0_predictor, hop_length, sampling_rate, **kwargs):

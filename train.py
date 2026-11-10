@@ -1,9 +1,17 @@
 import logging
 import multiprocessing
 import os
+import signal
 import time
 from contextlib import nullcontext
+from itertools import islice
 from pathlib import Path
+
+# Configure the allocator before torch (or a spawned worker) initializes CUDA.
+_alloc_env = "PYTORCH_ALLOC_CONF" if "PYTORCH_ALLOC_CONF" in os.environ else "PYTORCH_CUDA_ALLOC_CONF"
+_alloc_conf = os.environ.get(_alloc_env, "")
+if "expandable_segments" not in _alloc_conf:
+    os.environ[_alloc_env] = ",".join(filter(None, (_alloc_conf, "expandable_segments:True")))
 
 import torch
 import torch.distributed as dist
@@ -13,7 +21,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboardx import SummaryWriter
+from tensorboardX import SummaryWriter
 import modules.commons as commons
 import utils
 from data_utils import TextAudioCollate, TextAudioSpeakerLoader
@@ -22,6 +30,7 @@ from models import (
     SynthesizerTrn,
 )
 from modules.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from modules.cuda_graph import CudaGraphModule
 from modules.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 
 
@@ -39,8 +48,57 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 global_step = 0
 
 
+class TrainingInterrupt:
+    """Defer the first Ctrl+C to an optimizer boundary; a second aborts immediately."""
+
+    def __init__(self, stop_flag=None, announce=True):
+        self.stop_flag = stop_flag if stop_flag is not None else multiprocessing.get_context("spawn").Value(
+            "b", False, lock=False,
+        )
+        self.announce = announce
+        self.received = False
+
+    def __enter__(self):
+        self.previous_handler = signal.signal(signal.SIGINT, self.handle_signal)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        signal.signal(signal.SIGINT, self.previous_handler)
+
+    def handle_signal(self, signum, frame):
+        if self.received:
+            raise KeyboardInterrupt
+        self.received = True
+        # A lock-free flag also lets the spawn parent request a stop in every rank.
+        self.stop_flag.value = True
+        if self.announce:
+            os.write(2, b"\n[INFO] Ctrl+C received; finishing the current optimizer step, then saving and exiting. "
+                     b"Press Ctrl+C again to force exit.\n")
+
+    def should_stop(self):
+        requested = bool(self.stop_flag.value)
+        if dist.is_initialized():
+            # Every rank must make the same decision, even if SIGINT reaches only one.
+            device = torch.cuda.current_device() if dist.get_backend() == "nccl" else "cpu"
+            stop = torch.tensor(int(requested), dtype=torch.int32, device=device)
+            dist.all_reduce(stop, op=dist.ReduceOp.MAX)
+            requested = bool(stop.item())
+        return requested
+
+
+def ignore_worker_sigint(worker_id):
+    """The training process handles Ctrl+C; keep prefetched CPU batches available."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
 def unwrap(model):
     return model.module if isinstance(model, DDP) else model
+
+
+def gradient_norm(parameters):
+    """Keep norm reductions on-device; only logging needs a host scalar."""
+    gradients = [p.grad for p in parameters if p.grad is not None]
+    return torch.nn.utils.get_total_norm(gradients, foreach=True) if gradients else 0.0
 
 
 def amp_settings(train):
@@ -51,6 +109,13 @@ def amp_settings(train):
     if enabled and half_type == "bf16" and torch.cuda.get_device_capability()[0] < 8:
         raise ValueError("BF16 AMP requires an Ampere or newer GPU; use half_type=fp16")
     return enabled, torch.bfloat16 if half_type == "bf16" else torch.float16
+
+
+def gradient_accumulation_steps(train):
+    steps = getattr(train, "grad_accumulate", 1)
+    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+        raise ValueError("train.grad_accumulate must be a positive integer")
+    return steps
 
 
 def set_learning_rate(hps, optims, epoch):
@@ -94,7 +159,13 @@ def load_training_state(hps, nets, optims, scaler, batches_per_epoch, logger):
         # Keep FP32 master weights even when pretrained weights were saved in FP16.
         unwrap(nets[index]).load_state_dict(checkpoint["model"], strict=True)
         if has_pair and not skip_optimizer and checkpoint.get("optimizer") is not None:
-            optims[index].load_state_dict(checkpoint["optimizer"])
+            optimizer_state = checkpoint["optimizer"]
+            # Preserve the selected implementation when resuming an older checkpoint.
+            # Set these before loading so fused AdamW's step tensors move to CUDA too.
+            for group in optimizer_state["param_groups"]:
+                for option in ("fused", "foreach"):
+                    group[option] = optims[index].defaults[option]
+            optims[index].load_state_dict(optimizer_state)
         checkpoints.append(checkpoint)
         logger.info("Loaded %s", path)
     if not has_pair or skip_optimizer:
@@ -162,29 +233,34 @@ def main():
         run(0, 1, hps)
     else:
         # 多 GPU 使用 spawn
-        mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+        stop_flag = multiprocessing.get_context("spawn").Value("b", False, lock=False)
+        with TrainingInterrupt(stop_flag):
+            mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps, stop_flag))
 
 
-def run(rank, n_gpus, hps):
-    torch.cuda.set_device(rank)
-    try:
-        if n_gpus > 1:
-            backend = 'gloo' if os.name == 'nt' else 'nccl'
-            dist.init_process_group(backend=backend, init_method='env://', world_size=n_gpus, rank=rank)
-        run_training(rank, n_gpus, hps)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
+def run(rank, n_gpus, hps, stop_flag=None):
+    with TrainingInterrupt(stop_flag, announce=n_gpus == 1) as interrupt:
+        torch.cuda.set_device(rank)
+        try:
+            if n_gpus > 1:
+                backend = 'gloo' if os.name == 'nt' else 'nccl'
+                dist.init_process_group(backend=backend, init_method='env://', world_size=n_gpus, rank=rank)
+            run_training(rank, n_gpus, hps, interrupt=interrupt)
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
 
 
-def run_training(rank, n_gpus, hps):
+def run_training(rank, n_gpus, hps, interrupt=None):
     torch.manual_seed(hps.train.seed + rank)
+    torch.backends.cudnn.benchmark = getattr(hps.train, "cudnn_benchmark", True)
     amp_enabled, half_type = amp_settings(hps.train)
-    accum_steps = getattr(hps.train, "grad_accumulate", 1)
-    if not isinstance(accum_steps, int) or accum_steps < 1:
-        raise ValueError("train.grad_accumulate must be a positive integer")
+    gradient_accumulation_steps(hps.train)
     if hps.train.log_interval < 1 or hps.train.eval_interval < 1:
         raise ValueError("train.log_interval and train.eval_interval must be positive")
+    image_interval = getattr(hps.train, "image_interval", hps.train.eval_interval)
+    if not isinstance(image_interval, int) or image_interval < 0:
+        raise ValueError("train.image_interval must be a nonnegative integer (0 disables images)")
 
     # Logger & TensorBoard
     logger = None
@@ -210,7 +286,12 @@ def run_training(rank, n_gpus, hps):
         drop_last=True
     )
 
-    num_workers = 0 if all_in_mem else min(4, multiprocessing.cpu_count())
+    num_workers = 0 if all_in_mem else getattr(hps.train, "num_workers", min(4, multiprocessing.cpu_count()))
+    prefetch_factor = getattr(hps.train, "prefetch_factor", 4)
+    if not isinstance(num_workers, int) or num_workers < 0:
+        raise ValueError("train.num_workers must be a nonnegative integer")
+    if not isinstance(prefetch_factor, int) or prefetch_factor < 1:
+        raise ValueError("train.prefetch_factor must be a positive integer")
 
     train_loader = DataLoader(
         train_dataset,
@@ -219,8 +300,9 @@ def run_training(rank, n_gpus, hps):
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
         collate_fn=collate_fn,
+        worker_init_fn=ignore_worker_sigint,
         drop_last=True
     )
     if len(train_loader) == 0:
@@ -241,7 +323,8 @@ def run_training(rank, n_gpus, hps):
             batch_size=1,
             pin_memory=False,
             drop_last=False,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
+            worker_init_fn=ignore_worker_sigint,
         )
 
     # 创建模型
@@ -255,17 +338,20 @@ def run_training(rank, n_gpus, hps):
 
 
     # 优化器
+    fused_optimizer = getattr(hps.train, "fused_optimizer", True)
     optim_g = torch.optim.AdamW(
         net_g.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
-        eps=hps.train.eps
+        eps=hps.train.eps,
+        fused=fused_optimizer,
     )
     optim_d = torch.optim.AdamW(
         net_d.parameters(),
         hps.train.learning_rate,
         betas=hps.train.betas,
-        eps=hps.train.eps
+        eps=hps.train.eps,
+        fused=fused_optimizer,
     )
 
     # Load before DDP so master weights remain FP32 and bad checkpoints fail visibly.
@@ -287,13 +373,16 @@ def run_training(rank, n_gpus, hps):
             start_time = time.time()
             train_sampler.set_epoch(epoch)
             set_learning_rate(hps, (optim_g, optim_d), epoch)
-            train_one_epoch(
+            interrupted = train_one_epoch(
                 rank=rank, epoch=epoch, hps=hps,
                 nets=(net_g, net_d), optims=(optim_g, optim_d), scaler=scaler,
                 train_loader=train_loader, eval_loader=eval_loader, logger=logger,
                 writers=(writer, writer_eval), half_type=half_type,
                 start_batch=start_batch if epoch == epoch_str else 0,
+                interrupt=interrupt,
             )
+            if interrupted:
+                return
             if rank == 0:
                 logger.info('====> Epoch: %s, cost %.2f s', epoch, time.time() - start_time)
                 if epoch == hps.train.epochs:
@@ -306,9 +395,37 @@ def run_training(rank, n_gpus, hps):
                 summary_writer.close()
 
 
+def cuda_batches(loader, device):
+    """Overlap the next pinned CPU batch transfer with the current GPU step."""
+    batches = iter(loader)
+    copy_stream = torch.cuda.Stream(device=device)
+    main_stream = torch.cuda.current_stream(device)
+
+    def preload():
+        try:
+            items = next(batches)
+        except StopIteration:
+            return None
+        with torch.cuda.stream(copy_stream):
+            return tuple(item.cuda(device, non_blocking=True) if item is not None else None
+                         for item in items)
+
+    pending = preload()
+    while pending is not None:
+        # Wait for this batch before enqueuing the following transfer. Waiting
+        # afterwards would also serialize that transfer with the current step.
+        main_stream.wait_stream(copy_stream)
+        current = pending
+        for item in current:
+            if item is not None:
+                item.record_stream(main_stream)
+        pending = preload()
+        yield current
+
+
 def train_one_epoch(
     rank, epoch, hps, nets, optims, scaler, train_loader, eval_loader,
-    logger, writers, half_type, start_batch=0,
+    logger, writers, half_type, start_batch=0, interrupt=None,
 ):
     global global_step
 
@@ -316,8 +433,12 @@ def train_one_epoch(
     optim_g, optim_d = optims
     writer, writer_eval = writers if writers else (None, None)
 
-    accum_steps = getattr(hps.train, "grad_accumulate", 1)
+    accum_steps = gradient_accumulation_steps(hps.train)
+    for module in net_g.modules():
+        if isinstance(module, CudaGraphModule):
+            module.set_graph_gradient_accumulation(accum_steps > 1)
     amp_enabled = getattr(hps.train, "fp16_run", True)
+    image_interval = getattr(hps.train, "image_interval", hps.train.eval_interval)
     next_eval_step = (global_step // hps.train.eval_interval + 1) * hps.train.eval_interval
 
     net_g.train()
@@ -327,35 +448,19 @@ def train_one_epoch(
     optim_g.zero_grad(set_to_none=True)
     optim_d.zero_grad(set_to_none=True)
 
-    for batch_idx, items in enumerate(train_loader):
-        if batch_idx < start_batch:
-            continue
+    # Resume skips CPU batches before copying, so skipped data never reaches CUDA.
+    epoch_batches = islice(train_loader, start_batch, None)
+    for batch_idx, items in enumerate(cuda_batches(epoch_batches, rank), start=start_batch):
         # 加载数据
         c, f0, spec, y, spk, lengths, uv, volume = items
 
-        g = spk.cuda(rank, non_blocking=True)
-        spec = spec.cuda(rank, non_blocking=True)
-        y = y.cuda(rank, non_blocking=True)
-        c = c.cuda(rank, non_blocking=True)
-        f0 = f0.cuda(rank, non_blocking=True)
-        uv = uv.cuda(rank, non_blocking=True)
-        lengths = lengths.cuda(rank, non_blocking=True)
-        if volume is not None:
-            volume = volume.cuda(rank, non_blocking=True)
-
-        mel = spec_to_mel_torch(
-            spec,
-            hps.data.filter_length,
-            hps.data.n_mel_channels,
-            hps.data.sampling_rate,
-            hps.data.mel_fmin,
-            hps.data.mel_fmax
-        )
+        g = spk
 
         # The final accumulation window may contain fewer than accum_steps batches.
         window_start = start_batch + ((batch_idx - start_batch) // accum_steps) * accum_steps
         window_size = min(accum_steps, len(train_loader) - window_start)
         should_step = batch_idx + 1 == window_start + window_size
+        should_log = rank == 0 and (global_step + 1) % hps.train.log_interval == 0
 
         # DDP no_sync must enclose both the forward and the backward pass.
         g_sync_ctx = net_g.no_sync() if isinstance(net_g, DDP) and not should_step else nullcontext()
@@ -369,14 +474,21 @@ def train_one_epoch(
 
             # FFT, mel projection and losses stay in FP32 even while AMP is enabled.
             with autocast('cuda', enabled=False):
-                y_mel = commons.slice_segments(
-                    mel, ids_slice, hps.train.segment_size // hps.data.hop_length,
+                # Only the sampled segment participates in the mel loss.
+                # Project the full spectrogram lazily when plotting images.
+                y_mel = spec_to_mel_torch(
+                    commons.slice_segments(
+                        spec, ids_slice, hps.train.segment_size // hps.data.hop_length,
+                    ),
+                    hps.data.filter_length, hps.data.n_mel_channels,
+                    hps.data.sampling_rate, hps.data.mel_fmin, hps.data.mel_fmax,
                 )
                 y_hat_mel = mel_spectrogram_torch(
                     y_hat.squeeze(1).float(), hps.data.filter_length,
                     hps.data.n_mel_channels, hps.data.sampling_rate,
                     hps.data.hop_length, hps.data.win_length,
                     hps.data.mel_fmin, hps.data.mel_fmax,
+                    check_range=False,  # The decoder already bounds audio with tanh.
                 )
                 y_sliced = commons.slice_segments(
                     y, ids_slice * hps.data.hop_length, hps.train.segment_size,
@@ -385,17 +497,27 @@ def train_one_epoch(
             d_sync_ctx = net_d.no_sync() if isinstance(net_d, DDP) and not should_step else nullcontext()
             with d_sync_ctx:
                 with autocast('cuda', enabled=amp_enabled, dtype=half_type):
-                    y_d_hat_r, y_d_hat_g, _, _ = net_d(y_sliced, y_hat.detach())
+                    y_d_hat_r, y_d_hat_g, fmap_r, _ = net_d(y_sliced, y_hat.detach())
+                discriminator = unwrap(net_d)
+                reuse_real_features = not getattr(discriminator, "use_spectral_norm", True)
+                if reuse_real_features:
+                    # D has not stepped yet. These are exactly the real features
+                    # needed by G; detach before D's graph is freed by backward.
+                    fmap_r = [[feature.detach() for feature in layers] for layers in fmap_r]
                 with autocast('cuda', enabled=False):
-                    loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+                    loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g, return_details=False)
                 scaler.scale(loss_disc / window_size).backward()
 
             # G gradients pass through D, but must never accumulate into D's parameters.
-            discriminator = unwrap(net_d)
             discriminator.requires_grad_(False)
             try:
                 with autocast('cuda', enabled=amp_enabled, dtype=half_type):
-                    _, y_d_hat_g, fmap_r, fmap_g = discriminator(y_sliced, y_hat)
+                    if reuse_real_features:
+                        _, y_d_hat_g, _, fmap_g = discriminator(None, y_hat)
+                    else:
+                        # Spectral normalization updates its buffers on every
+                        # forward, so preserve its original sequence of calls.
+                        _, y_d_hat_g, fmap_r, fmap_g = discriminator(y_sliced, y_hat)
                 with autocast('cuda', enabled=False):
                     loss_mel = F.l1_loss(y_mel.float(), y_hat_mel.float()) * hps.train.c_mel
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
@@ -414,13 +536,13 @@ def train_one_epoch(
         if should_step:
             # Discriminator
             scaler.unscale_(optim_d)
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            grad_norm_d = gradient_norm(net_d.parameters()) if should_log else 0.0
             scaler.step(optim_d)
             optim_d.zero_grad(set_to_none=True)
 
             # Generator
             scaler.unscale_(optim_g)
-            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            grad_norm_g = gradient_norm(net_g.parameters()) if should_log else 0.0
             scaler.step(optim_g)
             scaler.update()
             optim_g.zero_grad(set_to_none=True)
@@ -430,58 +552,79 @@ def train_one_epoch(
 
         global_step += 1
 
+        # Save only after both optimizers and the scaler have finished the window.
+        # In-flight gradients are not checkpointed, so never stop halfway through it.
+        if should_step and interrupt is not None and interrupt.should_stop():
+            if rank == 0:
+                logger.info("Interrupt requested; saving epoch %s, next batch %s, step %s",
+                            epoch, batch_idx + 1, global_step)
+                save_training_state(hps, nets, optims, scaler, epoch, batch_idx + 1)
+                logger.info("Training state saved to %s; restart with the same model directory to resume",
+                            hps.model_dir)
+            if dist.is_initialized():
+                dist.barrier()
+            return True
+
         # Logging
-        if rank == 0 and global_step % hps.train.log_interval == 0:
+        if should_log:
             lr = optim_g.param_groups[0]['lr']
-            losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_kl]
-            reference_loss = sum(l.item() for l in losses) + loss_lf0.item()
+            # Transfer loss scalars together instead of synchronizing for every .item().
+            disc_value, gen_value, fm_value, mel_value, kl_value, lf0_value, total_value = (
+                torch.stack((loss_disc, loss_gen, loss_fm, loss_mel, loss_kl, loss_lf0, loss_gen_all))
+                .detach().float().cpu().tolist()
+            )
+            reference_loss = disc_value + gen_value + fm_value + mel_value + kl_value + lf0_value
 
             logger.info(
                 f'Train Epoch: {epoch} [{100. * batch_idx / len(train_loader):.0f}%] '
                 f'Step: {global_step}, LR: {lr:.6f}'
             )
             logger.info(
-                f"Losses - D: {loss_disc:.4f}, G: {loss_gen:.4f}, FM: {loss_fm:.4f}, "
-                f"Mel: {loss_mel:.4f}, KL: {loss_kl:.4f}, Total: {reference_loss:.4f}"
+                f"Losses - D: {disc_value:.4f}, G: {gen_value:.4f}, FM: {fm_value:.4f}, "
+                f"Mel: {mel_value:.4f}, KL: {kl_value:.4f}, Total: {reference_loss:.4f}"
             )
 
             if writer:
                 scalar_dict = {
-                    "loss/g/total": loss_gen_all.item(),
-                    "loss/d/total": loss_disc.item(),
+                    "loss/g/total": total_value,
+                    "loss/d/total": disc_value,
                     "learning_rate": lr,
                     "grad_norm_d": grad_norm_d,
                     "grad_norm_g": grad_norm_g,
-                    "loss/g/fm": loss_fm.item(),
-                    "loss/g/mel": loss_mel.item(),
-                    "loss/g/kl": loss_kl.item(),
-                    "loss/g/lf0": loss_lf0.item() if hasattr(loss_lf0, 'item') else loss_lf0,
+                    "loss/g/fm": fm_value,
+                    "loss/g/mel": mel_value,
+                    "loss/g/kl": kl_value,
+                    "loss/g/lf0": lf0_value,
                 }
-
-                image_dict = {
-                    "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].detach().cpu().numpy()),
-                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].detach().cpu().numpy()),
-                    "all/mel": utils.plot_spectrogram_to_numpy(mel[0].detach().cpu().numpy())
-                }
-
-                if unwrap(net_g).use_automatic_f0_prediction:
-                    image_dict.update({
-                        "all/lf0": utils.plot_data_to_numpy(
-                            lf0[0, 0, :].cpu().numpy(),
-                            pred_lf0[0, 0, :].detach().float().cpu().numpy()
-                        ),
-                        "all/norm_lf0": utils.plot_data_to_numpy(
-                            lf0[0, 0, :].cpu().numpy(),
-                            norm_lf0[0, 0, :].detach().float().cpu().numpy()
-                        )
-                    })
-
                 utils.summarize(
                     writer=writer,
                     global_step=global_step,
-                    images=image_dict,
                     scalars=scalar_dict
                 )
+
+        # Plotting is substantially slower than scalar logging on the training thread.
+        if rank == 0 and writer and image_interval and global_step % image_interval == 0:
+            mel = spec_to_mel_torch(
+                spec, hps.data.filter_length, hps.data.n_mel_channels,
+                hps.data.sampling_rate, hps.data.mel_fmin, hps.data.mel_fmax,
+            )
+            image_dict = {
+                "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].detach().cpu().numpy()),
+                "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].detach().cpu().numpy()),
+                "all/mel": utils.plot_spectrogram_to_numpy(mel[0].detach().cpu().numpy())
+            }
+            if unwrap(net_g).use_automatic_f0_prediction:
+                image_dict.update({
+                    "all/lf0": utils.plot_data_to_numpy(
+                        lf0[0, 0, :].cpu().numpy(),
+                        pred_lf0[0, 0, :].detach().float().cpu().numpy()
+                    ),
+                    "all/norm_lf0": utils.plot_data_to_numpy(
+                        lf0[0, 0, :].cpu().numpy(),
+                        norm_lf0[0, 0, :].detach().float().cpu().numpy()
+                    )
+                })
+            utils.summarize(writer=writer, global_step=global_step, images=image_dict)
 
         # Evaluation & Checkpoint
         if should_step and global_step >= next_eval_step:
@@ -492,6 +635,8 @@ def train_one_epoch(
             if dist.is_initialized():
                 dist.barrier()
             next_eval_step = (global_step // hps.train.eval_interval + 1) * hps.train.eval_interval
+
+    return False
 
 
 @torch.inference_mode()
@@ -549,8 +694,9 @@ def evaluate_samples(hps, generator, eval_loader, writer_eval, step):
             hps.data.mel_fmax
         )
 
-        audio_dict[f"gen/audio_{batch_idx}"] = y_hat[0].float().cpu()
-        audio_dict[f"gt/audio_{batch_idx}"] = y[0].cpu()
+        # tensorboardX accepts mono [samples] or channel-last [samples, channels].
+        audio_dict[f"gen/audio_{batch_idx}"] = y_hat[0, 0].float().cpu()
+        audio_dict[f"gt/audio_{batch_idx}"] = y[0, 0].cpu()
 
     # 使用最后一个 batch 的 mel
     image_dict["gen/mel"] = utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy())
