@@ -180,7 +180,15 @@ def load_training_state(hps, nets, optims, scaler, batches_per_epoch, logger):
     global_step = int(checkpoint.get("global_step", step + 1))
     batch_idx = int(checkpoint.get("batch_idx", global_step % batches_per_epoch))
     if not 0 <= batch_idx <= batches_per_epoch:
-        raise ValueError("Checkpoint batch offset is incompatible with the current DataLoader")
+        # batch_size or the training file list changed since this checkpoint, so the
+        # saved offset no longer maps to a position in the current epoch. Skipping
+        # ahead is unsafe, but restarting the epoch keeps training reproducible.
+        logger.warning(
+            "Checkpoint batch offset %s does not fit the current DataLoader "
+            "(%s batches per epoch); resuming at the start of epoch %s instead",
+            batch_idx, batches_per_epoch, epoch + 1,
+        )
+        batch_idx = batches_per_epoch
     if batch_idx == batches_per_epoch:
         epoch += 1
         batch_idx = 0

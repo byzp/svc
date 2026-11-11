@@ -1,6 +1,7 @@
 """Bounded native CUDA graphs for repeatedly used training submodules."""
 
 from collections import OrderedDict
+import gc
 import threading
 import weakref
 
@@ -26,7 +27,15 @@ class CudaGraphModule(torch.nn.Module):
         for handle in getattr(self, "_graph_grad_handles", ()):
             handle.remove()
         self._graph_grad_handles = []
+        cache = getattr(self, "_graph_cache", None)
         self._graph_cache = OrderedDict()
+        if cache:
+            with cuda_graph_lock:
+                cache.clear()
+                # make_graphed_callables creates a Function <-> Backward class
+                # cycle that owns static CUDA tensors even after eviction.
+                # Free-threaded Python may defer collection for many batches.
+                gc.collect()
 
     def _apply(self, fn, recurse=True):
         # Captures contain device addresses, so moving/casting a model invalidates
@@ -68,13 +77,22 @@ class CudaGraphModule(torch.nn.Module):
         if cache is None:
             cache = self._graph_cache = OrderedDict()
         if key not in cache:
+            # Evict before capture: otherwise three pools coexist at the
+            # capacity boundary. Collection must be outside stream capture;
+            # destroying an unrelated graph during capture is illegal.
+            with cuda_graph_lock:
+                if len(cache) >= self._max_cuda_graphs:
+                    while len(cache) >= self._max_cuda_graphs:
+                        cache.popitem(last=False)
+                    gc.collect()
             # Hooks for the outer accumulation must not be recorded inside a
             # trainable capture too. Frozen captures never visit these hooks.
             if trainable:
                 for handle in getattr(self, "_graph_grad_handles", ()):
                     handle.remove()
                 self._graph_grad_handles = []
-            original_forward = self.forward
+            had_forward = "forward" in self.__dict__
+            original_forward = self.__dict__.get("forward")
             sample_args = tuple(x.detach().clone().requires_grad_(x.requires_grad) for x in args)
             # Share parameter storage through fresh leaves, so capture never
             # visits DDP's retained AccumulateGrad nodes on the default stream.
@@ -101,10 +119,11 @@ class CudaGraphModule(torch.nn.Module):
                         allow_unused_input=getattr(self, "_allow_unused_graph_input", False),
                     )
             finally:
-                self.forward = original_forward
+                if had_forward:
+                    self.forward = original_forward
+                else:
+                    del self.forward
                 if trainable:
                     self._own_first_parameter_grad(trainable)
-            while len(cache) > self._max_cuda_graphs:
-                cache.popitem(last=False)
         cache.move_to_end(key)
         return cache[key](*args, *parameters)
