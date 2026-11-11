@@ -4,6 +4,7 @@ from torch.nn import functional as F
 
 import modules.commons as commons
 from modules.cuda_graph import CudaGraphModule
+from modules.fused_ops import residual_step, final_skip
 from modules.weight_norm import remove_weight_norm as remove_weight_norm_modules
 from modules.weight_norm import weight_norm as weight_norm_modules
 
@@ -95,12 +96,10 @@ class WN(CudaGraphModule):
 
       res_skip_acts = self.res_skip_layers[i](acts)
       if i < self.n_layers - 1:
-        res_acts = res_skip_acts[:,:self.hidden_channels,:]
-        x = (x + res_acts) * x_mask
-        output = output + res_skip_acts[:,self.hidden_channels:,:]
+        x, output = residual_step(x, output, res_skip_acts, x_mask)
       else:
-        output = output + res_skip_acts
-    return output * x_mask
+        output = final_skip(output, res_skip_acts, x_mask)
+    return output
 
   def remove_weight_norm(self):
     if self.gin_channels != 0:

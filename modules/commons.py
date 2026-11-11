@@ -1,5 +1,6 @@
 
 import torch
+from modules.fused_ops import gated_activation
 
 
 def slice_pitch_segments(x, ids_str, segment_size=4):
@@ -64,12 +65,7 @@ def subsequent_mask(length):
 
 
 def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
-  n_channels_int = n_channels
-  in_act = input_a + input_b
-  t_act = torch.tanh(in_act[:, :n_channels_int, :])
-  s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
-  acts = t_act * s_act
-  return acts
+  return gated_activation(input_a, input_b, n_channels)
 
 
 

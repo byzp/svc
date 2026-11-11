@@ -19,12 +19,12 @@ import torch.multiprocessing as mp
 from torch.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tensorboardX import SummaryWriter
 import modules.commons as commons
 import utils
 from data_utils import TextAudioCollate, TextAudioSpeakerLoader
+from thread_loader import ThreadDataLoader
 from models import (
     MultiPeriodDiscriminator,
     SynthesizerTrn,
@@ -67,7 +67,9 @@ class TrainingInterrupt:
 
     def handle_signal(self, signum, frame):
         if self.received:
-            raise KeyboardInterrupt
+            # Python joins executor threads on exit. A forced stop must not wait
+            # for a worker blocked in disk I/O, or for a checkpoint to finish.
+            os._exit(130)
         self.received = True
         # A lock-free flag also lets the spawn parent request a stop in every rank.
         self.stop_flag.value = True
@@ -84,11 +86,6 @@ class TrainingInterrupt:
             dist.all_reduce(stop, op=dist.ReduceOp.MAX)
             requested = bool(stop.item())
         return requested
-
-
-def ignore_worker_sigint(worker_id):
-    """The training process handles Ctrl+C; keep prefetched CPU batches available."""
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 def unwrap(model):
@@ -273,7 +270,7 @@ def run_training(rank, n_gpus, hps, interrupt=None):
         logger.info("AMP: %s, dtype: %s", amp_enabled, half_type)
 
     # 数据集和 DataLoader
-    collate_fn = TextAudioCollate()
+    collate_fn = TextAudioCollate(pin_memory=True)
     all_in_mem = hps.train.all_in_mem
     train_dataset = TextAudioSpeakerLoader(hps.data.training_files, hps, all_in_mem=all_in_mem)
 
@@ -292,17 +289,21 @@ def run_training(rank, n_gpus, hps, interrupt=None):
         raise ValueError("train.num_workers must be a nonnegative integer")
     if not isinstance(prefetch_factor, int) or prefetch_factor < 1:
         raise ValueError("train.prefetch_factor must be a positive integer")
+    if num_workers > 0:
+        # Batches already run in parallel; avoid a nested OpenMP team per worker.
+        torch.set_num_threads(1)
+    if logger is not None:
+        logger.info("Audio loading: %s threads, prefetch_factor=%s", num_workers, prefetch_factor)
 
-    train_loader = DataLoader(
+    train_loader = ThreadDataLoader(
         train_dataset,
         batch_size=hps.train.batch_size,
         sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor,
         collate_fn=collate_fn,
-        worker_init_fn=ignore_worker_sigint,
+        seed=hps.train.seed + rank,
         drop_last=True
     )
     if len(train_loader) == 0:
@@ -316,15 +317,14 @@ def run_training(rank, n_gpus, hps, interrupt=None):
         eval_dataset = TextAudioSpeakerLoader(
             hps.data.validation_files, hps, all_in_mem=all_in_mem, vol_aug=False
         )
-        eval_loader = DataLoader(
+        eval_loader = ThreadDataLoader(
             eval_dataset,
             num_workers=1,
-            shuffle=False,
             batch_size=1,
             pin_memory=False,
             drop_last=False,
-            collate_fn=collate_fn,
-            worker_init_fn=ignore_worker_sigint,
+            collate_fn=TextAudioCollate(),
+            seed=hps.train.seed + rank,
         )
 
     # 创建模型
@@ -390,6 +390,9 @@ def run_training(rank, n_gpus, hps, interrupt=None):
             if n_gpus > 1:
                 dist.barrier()
     finally:
+        train_loader.close()
+        if eval_loader is not None:
+            eval_loader.close()
         for summary_writer in (writer, writer_eval):
             if summary_writer is not None:
                 summary_writer.close()
@@ -522,7 +525,7 @@ def train_one_epoch(
                     loss_mel = F.l1_loss(y_mel.float(), y_hat_mel.float()) * hps.train.c_mel
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
                     loss_fm = feature_loss(fmap_r, fmap_g)
-                    loss_gen, _ = generator_loss(y_d_hat_g)
+                    loss_gen, _ = generator_loss(y_d_hat_g, return_details=False)
                     loss_lf0 = (
                         F.mse_loss(pred_lf0.float(), lf0.float())
                         if unwrap(net_g).use_automatic_f0_prediction else loss_mel.new_zeros(())

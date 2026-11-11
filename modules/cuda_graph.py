@@ -1,9 +1,15 @@
 """Bounded native CUDA graphs for repeatedly used training submodules."""
 
 from collections import OrderedDict
+import threading
 import weakref
 
 import torch
+
+
+# Global stream capture also rejects CUDA host allocations in other threads.
+# Share this lock with the loader's pinned allocator, not its CPU data work.
+cuda_graph_lock = threading.Lock()
 
 
 class CudaGraphModule(torch.nn.Module):
@@ -86,6 +92,7 @@ class CudaGraphModule(torch.nn.Module):
                 # Warmup/capture must not consume the training RNG sequence.
                 # AMP's weight cache must stay off while recording a graph.
                 with (
+                    cuda_graph_lock,
                     torch.random.fork_rng(devices=[args[0].device]),
                     torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype, cache_enabled=False),
                 ):

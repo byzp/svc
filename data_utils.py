@@ -1,11 +1,13 @@
 import os
 import random
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.utils.data
 
 import utils
+from modules.cuda_graph import cuda_graph_lock
 from modules.mel_processing import spectrogram_torch
 from utils import load_filepaths_and_text, load_wav_to_torch
 
@@ -47,8 +49,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         self.vol_emb = hparams.model.vol_embedding
         self.volume_extractor = utils.Volume_Extractor(self.hop_length) if self.recompute_mel and self.vol_emb else None
         self.vol_aug = hparams.train.vol_aug and vol_aug
-        random.seed(1234)
-        random.shuffle(self.audiopaths)
+        random.Random(1234).shuffle(self.audiopaths)
 
         self.all_in_mem = all_in_mem
         if self.all_in_mem:
@@ -73,8 +74,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                                      self.sampling_rate, self.hop_length, self.win_length,
                                      center=False)
             spec = torch.squeeze(spec, 0)
+            """
             if self.use_cached_spectrogram:
                 torch.save(spec, spec_filename)
+            """
 
         spk = filename.split("/")[-2]
         spk = torch.LongTensor([self.spk_map[spk]])
@@ -105,15 +108,16 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             volume = volume[:lmin]
         return c, f0, spec, audio_norm, spk, uv, volume
 
-    def random_slice(self, c, f0, spec, audio_norm, spk, uv, volume):
+    def random_slice(self, c, f0, spec, audio_norm, spk, uv, volume, rng=None):
+        rng = random if rng is None else rng
         # if spec.shape[1] < 30:
         #     print("skip too short audio:", filename)
         #     return None
 
-        if random.choice([True, False]) and self.vol_aug and volume is not None:
+        if rng.choice([True, False]) and self.vol_aug and volume is not None:
             max_amp = float(torch.max(torch.abs(audio_norm))) + 1e-5
             max_shift = min(1, np.log10(1/max_amp))
-            log10_vol_shift = random.uniform(-1, max_shift)
+            log10_vol_shift = rng.uniform(-1, max_shift)
             gain = 10 ** log10_vol_shift
             audio_norm = audio_norm * gain
             volume = volume * gain
@@ -122,7 +126,7 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
             spec = ((spec.square() - 1e-6).clamp_min_(0) * gain ** 2 + 1e-6).sqrt()
 
         if spec.shape[1] > self.spec_len:
-            start = random.randint(0, spec.shape[1] - self.spec_len)
+            start = rng.randint(0, spec.shape[1] - self.spec_len)
             end = start + self.spec_len
             spec, c, f0, uv = spec[:, start:end], c[:, start:end], f0[start:end], uv[start:end]
             audio_norm = audio_norm[:, start * self.hop_length : end * self.hop_length]
@@ -131,16 +135,22 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         return c, f0, spec, audio_norm, spk, uv,volume
 
     def __getitem__(self, index):
+        return self.get_item(index)
+
+    def get_item(self, index, rng=None):
         if self.all_in_mem:
-            return self.random_slice(*self.cache[index])
+            return self.random_slice(*self.cache[index], rng=rng)
         else:
-            return self.random_slice(*self.get_audio(self.audiopaths[index][0]))
+            return self.random_slice(*self.get_audio(self.audiopaths[index][0]), rng=rng)
 
     def __len__(self):
         return len(self.audiopaths)
 
 
 class TextAudioCollate:
+
+    def __init__(self, pin_memory=False):
+        self.pin_memory = pin_memory
 
     def __call__(self, batch):
         batch = [b for b in batch if b is not None]
@@ -152,22 +162,20 @@ class TextAudioCollate:
         max_c_len = max([x[0].size(1) for x in batch])
         max_wav_len = max([x[3].size(1) for x in batch])
 
-        lengths = torch.LongTensor(len(batch))
-
-        c_padded = torch.FloatTensor(len(batch), batch[0][0].shape[0], max_c_len)
-        f0_padded = torch.FloatTensor(len(batch), max_c_len)
-        spec_padded = torch.FloatTensor(len(batch), batch[0][2].shape[0], max_c_len)
-        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
-        spkids = torch.LongTensor(len(batch), 1)
-        uv_padded = torch.FloatTensor(len(batch), max_c_len)
-        volume_padded = torch.FloatTensor(len(batch), max_c_len)
-
-        c_padded.zero_()
-        spec_padded.zero_()
-        f0_padded.zero_()
-        wav_padded.zero_()
-        uv_padded.zero_()
-        volume_padded.zero_()
+        # Assemble directly into pinned storage: no pageable-to-pinned batch copy.
+        options = dict(dtype=torch.float32, device="cpu", pin_memory=self.pin_memory)
+        # A cache miss can call cuMemHostAlloc, which invalidates a concurrent
+        # CUDA graph capture. Only allocation is guarded; filling stays parallel.
+        with cuda_graph_lock if self.pin_memory else nullcontext():
+            lengths = torch.empty(len(batch), dtype=torch.long, device="cpu", pin_memory=self.pin_memory)
+            c_padded = torch.zeros(len(batch), batch[0][0].shape[0], max_c_len, **options)
+            f0_padded = torch.zeros(len(batch), max_c_len, **options)
+            spec_padded = torch.zeros(len(batch), batch[0][2].shape[0], max_c_len, **options)
+            wav_padded = torch.zeros(len(batch), 1, max_wav_len, **options)
+            spkids = torch.empty(len(batch), 1, dtype=torch.long, device="cpu", pin_memory=self.pin_memory)
+            uv_padded = torch.zeros(len(batch), max_c_len, **options)
+            volume_padded = (torch.zeros(len(batch), max_c_len, **options)
+                             if batch[0][6] is not None else None)
 
         for i in range(len(ids_sorted_decreasing)):
             row = batch[ids_sorted_decreasing[i]]

@@ -146,13 +146,29 @@ class MultiHeadAttention(nn.Module):
         self.conv_k.bias.copy_(self.conv_q.bias)
 
   def forward(self, x, c, attn_mask=None, is_causal=False):
-    q = self.conv_q(x)
-    k = self.conv_k(c)
-    v = self.conv_v(c)
+    # A 1x1 convolution is an affine projection at each time position.
+    # Pack self-attention's Q/K/V while retaining the existing parameters and
+    # checkpoint keys. GEMM wins on Volta; Pascal favors cuDNN's packed conv.
+    use_linear = not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] >= 7
+    if x is c:
+      weight = torch.cat((self.conv_q.weight, self.conv_k.weight, self.conv_v.weight))
+      bias = torch.cat((self.conv_q.bias, self.conv_k.bias, self.conv_v.bias))
+      if use_linear:
+        projected = F.linear(x.transpose(1, 2), weight.squeeze(-1), bias).transpose(1, 2)
+      else:
+        projected = F.conv1d(x, weight, bias)
+      q, k, v = projected.chunk(3, dim=1)
+    else:
+      q = self.conv_q(x)
+      k = self.conv_k(c)
+      v = self.conv_v(c)
 
     x, self.attn = self.attention(q, k, v, mask=attn_mask, is_causal=is_causal)
 
-    x = self.conv_o(x)
+    if use_linear:
+      x = F.linear(x.transpose(1, 2), self.conv_o.weight.squeeze(-1), self.conv_o.bias).transpose(1, 2)
+    else:
+      x = self.conv_o(x)
     return x
 
   def attention(self, query, key, value, mask=None, is_causal=False):
